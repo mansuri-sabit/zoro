@@ -82,8 +82,15 @@ type Config struct {
 
 func Load(envFile string) (*Config, error) {
 	if envFile != "" {
+		// Try to load .env file, but don't fail if it doesn't exist
+		// This allows the app to work with environment variables only (e.g., in production)
 		if err := godotenv.Load(envFile); err != nil {
-			return nil, fmt.Errorf("failed to load .env file: %w", err)
+			// If file doesn't exist, that's okay - we'll use environment variables directly
+			// Only fail if it's a different error (permission, etc.)
+			if !os.IsNotExist(err) {
+				return nil, fmt.Errorf("failed to load .env file: %w", err)
+			}
+			// File doesn't exist - continue without it, use environment variables
 		}
 	}
 
