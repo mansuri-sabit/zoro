@@ -1,0 +1,1380 @@
+openapi: 3.0.3
+info:
+  title: Troika Tech Calling Platform API
+  description: Production-ready bulk & single calling platform with Exotel integration
+  version: 1.0.0
+  contact:
+    name: Troika Tech
+    email: support@troikatech.in
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.troikatech.in
+    description: Production
+
+tags:
+  - name: Health
+    description: Health check and metrics
+  - name: Authentication
+    description: User authentication and authorization
+  - name: Contacts
+    description: Contact management
+  - name: Campaigns
+    description: Campaign management
+  - name: Calls
+    description: Call management and recordings
+  - name: Personas
+    description: Persona management (admin only)
+  - name: Suppression
+    description: Suppression list management
+  - name: Analytics
+    description: Analytics and reporting
+  - name: AI
+    description: AI-powered features (script generation, summarization)
+  - name: Users
+    description: User management (admin only)
+  - name: Audit
+    description: Audit log access (admin/auditor only)
+  - name: Voicebot
+    description: Exotel Voicebot endpoints
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      tags: [Health]
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  timestamp:
+                    type: string
+                    format: date-time
+                  services:
+                    type: object
+                    properties:
+                      api:
+                        type: string
+                      database:
+                        type: string
+                      redis:
+                        type: string
+
+  /metrics:
+    get:
+      summary: Get metrics (JSON format)
+      tags: [Health]
+      responses:
+        '200':
+          description: Metrics data
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /metrics/prometheus:
+    get:
+      summary: Get metrics (Prometheus format)
+      tags: [Health]
+      responses:
+        '200':
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /auth/login:
+    post:
+      summary: User login
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: admin@troikatech.in
+                password:
+                  type: string
+                  format: password
+                  example: admin123
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token:
+                    type: string
+                  refresh_token:
+                    type: string
+                  expires_in:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/register:
+    post:
+      summary: User registration (dev only)
+      tags: [Authentication]
+      description: Only available when ALLOW_SELF_REGISTER=true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  format: password
+                role:
+                  type: string
+                  enum: [viewer, operator, manager, auditor]
+                  default: viewer
+      responses:
+        '201':
+          description: Registration successful
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Self-registration disabled
+
+  /auth/refresh:
+    post:
+      summary: Refresh access token
+      tags: [Authentication]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: Token refreshed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token:
+                    type: string
+                  refresh_token:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      summary: Logout and revoke tokens
+      tags: [Authentication]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Logout successful
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/contacts/import:
+    post:
+      summary: Import contacts (bulk)
+      tags: [Contacts]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contacts]
+              properties:
+                contacts:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ContactImport'
+      responses:
+        '201':
+          description: Contacts imported
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/contacts/search:
+    get:
+      summary: Search contacts
+      tags: [Contacts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: tag
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [dnd, consented]
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 100
+      responses:
+        '200':
+          description: Contacts list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/contacts/{id}:
+    get:
+      summary: Get contact by ID
+      tags: [Contacts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Contact details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    put:
+      summary: Update contact
+      tags: [Contacts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                tags:
+                  type: array
+                  items:
+                    type: string
+                dnd:
+                  type: boolean
+                consent:
+                  type: boolean
+      responses:
+        '200':
+          description: Contact updated
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      summary: Delete contact
+      tags: [Contacts]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Contact deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/suppression/add:
+    post:
+      summary: Add number to suppression list
+      tags: [Suppression]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [msisdn_e164, source]
+              properties:
+                msisdn_e164:
+                  type: string
+                  pattern: '^\+[1-9]\d{1,14}$'
+                  example: "+919876543210"
+                source:
+                  type: string
+                  example: "manual"
+                reason:
+                  type: string
+      responses:
+        '201':
+          description: Number added to suppression list
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/suppression/check/{phone}:
+    get:
+      summary: Check if number is suppressed
+      tags: [Suppression]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: phone
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Suppression status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  msisdn_e164:
+                    type: string
+                  suppressed:
+                    type: boolean
+
+  /api/calls:
+    post:
+      summary: Create a call
+      tags: [Calls]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to, flow_id]
+              properties:
+                from:
+                  type: string
+                  example: "+919876543210"
+                to:
+                  type: string
+                  example: "+919876543211"
+                flow_id:
+                  type: string
+      responses:
+        '200':
+          description: Call initiated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  call_sid:
+                    type: string
+                  status:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Compliance check failed (suppressed, DND, outside hours)
+
+  /api/calls/{call_sid}:
+    get:
+      summary: Get call details
+      tags: [Calls]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: call_sid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Call details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Call'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/recordings/{call_sid}:
+    get:
+      summary: Get call recording
+      tags: [Calls]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: call_sid
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: Redirect to recording URL
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/campaigns:
+    post:
+      summary: Create campaign
+      tags: [Campaigns]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCampaignRequest'
+      responses:
+        '201':
+          description: Campaign created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaign_id:
+                    type: integer
+                  message:
+                    type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+    get:
+      summary: List campaigns
+      tags: [Campaigns]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [draft, scheduled, running, paused, completed, cancelled]
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Campaigns list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+
+  /api/campaigns/{id}:
+    get:
+      summary: Get campaign details
+      tags: [Campaigns]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Campaign details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Campaign'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/campaigns/{id}/pause:
+    post:
+      summary: Pause campaign
+      tags: [Campaigns]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Campaign paused
+
+  /api/campaigns/{id}/resume:
+    post:
+      summary: Resume campaign
+      tags: [Campaigns]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Campaign resumed
+
+  /api/campaigns/{id}/cancel:
+    post:
+      summary: Cancel campaign
+      tags: [Campaigns]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Campaign cancelled
+
+  /api/campaigns/{id}/contacts:
+    get:
+      summary: Get campaign contacts
+      tags: [Campaigns]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Campaign contacts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+
+  /api/personas:
+    get:
+      summary: List personas
+      tags: [Personas]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Personas list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+
+    post:
+      summary: Create persona (admin only)
+      tags: [Personas]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                script_template:
+                  type: string
+                voice_settings:
+                  type: object
+      responses:
+        '201':
+          description: Persona created
+        '403':
+          description: Admin access required
+
+  /api/personas/{id}:
+    get:
+      summary: Get persona
+      tags: [Personas]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Persona details
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      summary: Update persona (admin only)
+      tags: [Personas]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Persona updated
+        '403':
+          description: Admin access required
+
+  /api/analytics/overview:
+    get:
+      summary: Get analytics overview
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Analytics overview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  overview:
+                    type: object
+                    properties:
+                      total_calls:
+                        type: integer
+                      completed_calls:
+                        type: integer
+                      avg_duration:
+                        type: number
+                      total_cost:
+                        type: number
+                  period:
+                    type: string
+
+  /api/analytics/drilldown:
+    get:
+      summary: Get analytics drilldown
+      tags: [Analytics]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: campaign_id
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Analytics drilldown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stats:
+                    type: object
+                  total_contacts:
+                    type: integer
+
+  /api/ai/script:
+    post:
+      summary: Generate AI script (feature flag)
+      tags: [AI]
+      security:
+        - bearerAuth: []
+      description: Only available when FEATURE_AI=true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [persona_id]
+              properties:
+                persona_id:
+                  type: integer
+                context:
+                  type: object
+      responses:
+        '200':
+          description: Script generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  script_blocks:
+                    type: array
+                    items:
+                      type: string
+                  compliance:
+                    type: array
+                    items:
+                      type: string
+                  engine:
+                    type: string
+        '503':
+          description: AI service unavailable
+        '403':
+          description: Feature disabled
+
+  /api/ai/summarize:
+    post:
+      summary: Summarize call (feature flag)
+      tags: [AI]
+      security:
+        - bearerAuth: []
+      description: Only available when FEATURE_AI=true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                call_sid:
+                  type: string
+                recording_url:
+                  type: string
+      responses:
+        '200':
+          description: Call summarized
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  summary:
+                    type: string
+                  tags:
+                    type: array
+                    items:
+                      type: string
+                  key_points:
+                    type: array
+                    items:
+                      type: string
+                  sentiment:
+                    type: string
+
+  /api/users:
+    get:
+      summary: List users (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Users list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+        '403':
+          description: Admin access required
+
+    post:
+      summary: Create user (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, role]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                role:
+                  type: string
+                  enum: [admin, manager, operator, viewer, auditor]
+      responses:
+        '201':
+          description: User created
+        '403':
+          description: Admin access required
+
+  /api/users/{id}:
+    get:
+      summary: Get user by ID
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: User details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      summary: Update user (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                  format: email
+                role:
+                  type: string
+                  enum: [admin, manager, operator, viewer, auditor]
+                is_active:
+                  type: boolean
+      responses:
+        '200':
+          description: User updated
+        '403':
+          description: Admin access required
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      summary: Delete user (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: User deleted
+        '403':
+          description: Admin access required
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/users/{id}/activate:
+    post:
+      summary: Activate user (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: User activated
+        '403':
+          description: Admin access required
+
+  /api/users/{id}/deactivate:
+    post:
+      summary: Deactivate user (admin only)
+      tags: [Users]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: User deactivated
+        '403':
+          description: Admin access required
+
+  /api/audit-logs:
+    get:
+      summary: List audit logs (admin/auditor only)
+      tags: [Audit]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: user_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: resource_type
+          in: query
+          schema:
+            type: string
+        - name: resource_id
+          in: query
+          schema:
+            type: string
+        - name: start_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: end_date
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Audit logs list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedResponse'
+        '403':
+          description: Admin or auditor access required
+
+  /voicebot/init:
+    post:
+      summary: Exotel Voicebot initialization endpoint
+      tags: [Voicebot]
+      description: Public endpoint called by Exotel to initialize Voicebot session
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                CallSid:
+                  type: string
+                From:
+                  type: string
+                To:
+                  type: string
+      responses:
+        '200':
+          description: WebSocket URL for Voicebot
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  websocket_url:
+                    type: string
+
+  /voicebot/ws:
+    get:
+      summary: Voicebot WebSocket endpoint
+      tags: [Voicebot]
+      description: WebSocket connection for real-time audio streaming
+      parameters:
+        - name: call_sid
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+        - name: to
+          in: query
+          schema:
+            type: string
+      responses:
+        '101':
+          description: WebSocket upgrade successful
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ContactImport:
+      type: object
+      required: [msisdn_e164]
+      properties:
+        msisdn_e164:
+          type: string
+          pattern: '^\+[1-9]\d{1,14}$'
+        name:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        consent:
+          type: boolean
+        consent_source:
+          type: string
+
+    Contact:
+      type: object
+      properties:
+        id:
+          type: integer
+        msisdn_e164:
+          type: string
+        name:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        dnd:
+          type: boolean
+        consent:
+          type: boolean
+        consent_source:
+          type: string
+        consent_timestamp:
+          type: string
+          format: date-time
+        last_call_at:
+          type: string
+          format: date-time
+
+    CreateCampaignRequest:
+      type: object
+      required: [name, contacts, flow_id]
+      properties:
+        name:
+          type: string
+        contacts:
+          type: array
+          items:
+            type: object
+            properties:
+              msisdn_e164:
+                type: string
+              name:
+                type: string
+              tags:
+                type: array
+                items:
+                  type: string
+        window:
+          type: object
+          properties:
+            start:
+              type: integer
+              minimum: 0
+              maximum: 23
+            end:
+              type: integer
+              minimum: 0
+              maximum: 23
+        retries:
+          type: object
+          properties:
+            max:
+              type: integer
+            gap_min:
+              type: integer
+        flow_id:
+          type: string
+        persona_id:
+          type: integer
+
+    Campaign:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        status:
+          type: string
+          enum: [draft, scheduled, running, paused, completed, cancelled]
+        window_start:
+          type: integer
+        window_end:
+          type: integer
+        max_retries:
+          type: integer
+        flow_id:
+          type: string
+        persona_id:
+          type: integer
+        stats:
+          type: object
+        total_contacts:
+          type: integer
+
+    Call:
+      type: object
+      properties:
+        call_sid:
+          type: string
+        direction:
+          type: string
+          enum: [inbound, outbound]
+        from_number:
+          type: string
+        to_number:
+          type: string
+        status:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+        duration_sec:
+          type: integer
+        recording_url:
+          type: string
+        cost:
+          type: number
+          format: float
+
+    PaginatedResponse:
+      type: object
+      properties:
+        data:
+          type: array
+        page:
+          type: integer
+        limit:
+          type: integer
+        count:
+          type: integer
+        total:
+          type: integer
+
+    ProblemDetail:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        trace_id:
+          type: string
+        instance:
+          type: string
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        role:
+          type: string
+          enum: [admin, manager, operator, viewer, auditor]
+        is_active:
+          type: boolean
+        last_login_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          example:
+            type: "about:blank"
+            title: "Bad Request"
+            status: 400
+            detail: "Invalid request parameters"
+            trace_id: "abc123"
+
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          example:
+            type: "about:blank"
+            title: "Unauthorized"
+            status: 401
+            detail: "Invalid or expired token"
+            trace_id: "abc123"
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          example:
+            type: "about:blank"
+            title: "Not Found"
+            status: 404
+            detail: "Resource not found"
+            trace_id: "abc123"
+
