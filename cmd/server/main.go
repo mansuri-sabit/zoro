@@ -433,6 +433,9 @@ func (s *UnifiedServer) setupRouter() *gin.Engine {
 	router.POST("/voicebot/init", s.handler.ExotelVoicebotEndpoint)
 	router.GET("/voicebot/ws", s.handler.VoicebotWebSocket)
 
+	// Also support /was endpoint as per original requirements
+	router.GET("/was", s.handler.VoicebotWebSocket)
+
 	return router
 }
 
