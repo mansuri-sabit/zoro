@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -287,11 +288,12 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	}
 
 	// WebSocket endpoint with call parameters - use /was as per requirements
+	// URL encode all parameters to handle special characters properly
 	wsURL := fmt.Sprintf("%s/was?sample-rate=16000&call_sid=%s&from=%s&to=%s",
 		wsBaseURL,
-		req.CallSid,
-		req.From,
-		req.To,
+		url.QueryEscape(req.CallSid),
+		url.QueryEscape(req.From),
+		url.QueryEscape(req.To),
 	)
 
 	h.logger.Info("Generated WebSocket URL for Exotel",
@@ -339,11 +341,26 @@ func createWebSocketUpgrader(cfg *env.Config) websocket.Upgrader {
 // Must be accessible via public wss:// URL for Exotel to connect
 // No authentication required (direct connect as per requirements)
 func (h *Handler) VoicebotWebSocket(c *gin.Context) {
+	// Log all query parameters for debugging
+	h.logger.Info("VoicebotWebSocket connection attempt",
+		zap.String("path", c.Request.URL.Path),
+		zap.String("raw_query", c.Request.URL.RawQuery),
+		zap.Any("query_params", c.Request.URL.Query()),
+		zap.String("method", c.Request.Method),
+		zap.String("remote_addr", c.Request.RemoteAddr),
+	)
+
 	// Get call parameters from query string (Exotel sends call_sid or callLogId)
+	// Try multiple parameter name variations that Exotel might use
 	callSid := c.Query("call_sid")
 	if callSid == "" {
-		// Try callLogId as fallback (Exotel may use either)
+		callSid = c.Query("CallSid")
+	}
+	if callSid == "" {
 		callSid = c.Query("callLogId")
+	}
+	if callSid == "" {
+		callSid = c.Query("CallLogId")
 	}
 	from := c.Query("from")
 	to := c.Query("to")
@@ -369,9 +386,16 @@ func (h *Handler) VoicebotWebSocket(c *gin.Context) {
 		sampleRate = 16000
 	}
 
+	// Allow WebSocket connection even without call_sid
+	// We'll try to extract it from the first "start" event
 	if callSid == "" {
-		errors.BadRequest(c, "call_sid or callLogId is required")
-		return
+		h.logger.Warn("VoicebotWebSocket called without call_sid - will try to extract from first message",
+			zap.String("raw_query", c.Request.URL.RawQuery),
+			zap.Any("query_params", c.Request.URL.Query()),
+			zap.String("url", c.Request.URL.String()),
+		)
+		// Use temporary identifier - will be replaced when we get call_sid from start event
+		callSid = "pending-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 
 	// Create secure WebSocket upgrader with origin validation
@@ -395,13 +419,17 @@ func (h *Handler) VoicebotWebSocket(c *gin.Context) {
 		logger.MaskPhoneIfPresent("from", from),
 		logger.MaskPhoneIfPresent("to", to),
 		zap.Int("sample_rate", sampleRate),
+		zap.Bool("call_sid_from_query", callSid != "" && !strings.HasPrefix(callSid, "pending-")),
 	)
 
-	// Create or update call record in database
-	h.initializeCallRecord(callSid, from, to)
+	// Create or update call record in database (only if we have real call_sid)
+	if callSid != "" && !strings.HasPrefix(callSid, "pending-") {
+		h.initializeCallRecord(callSid, from, to)
+	}
 
 	// Handle WebSocket messages - Exotel sends JSON events, not binary
-	h.handleVoicebotConnection(conn, callSid, from, to, sampleRate)
+	// Pass a pointer to callSid so it can be updated when we get it from start event
+	h.handleVoicebotConnection(conn, &callSid, from, to, sampleRate)
 }
 
 // initializeCallRecord creates or updates call record when Voicebot session starts
@@ -437,7 +465,8 @@ func (h *Handler) initializeCallRecord(callSid, from, to string) {
 }
 
 // handleVoicebotConnection manages the WebSocket connection lifecycle
-func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, to string, sampleRate int) {
+// callSidPtr is a pointer so we can update it when we get the real call_sid from start event
+func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSidPtr *string, from, to string, sampleRate int) {
 	// Set read deadline to detect connection closure
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPongHandler(func(string) error {
@@ -466,7 +495,7 @@ func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, 
 
 			// Exotel sends JSON events as text messages
 			if messageType == websocket.TextMessage {
-				h.handleExotelEvent(conn, callSid, from, to, message, sampleRate)
+				h.handleExotelEvent(conn, callSidPtr, from, to, message, sampleRate)
 			} else if messageType == websocket.PingMessage {
 				conn.WriteMessage(websocket.PongMessage, nil)
 			}
@@ -478,11 +507,13 @@ func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, 
 		select {
 		case <-done:
 			h.logger.Info("Voicebot WebSocket connection closed",
-				zap.String("call_sid", callSid),
+				zap.String("call_sid", *callSidPtr),
 			)
 			// Clean up session
-			removeSession(callSid)
-			h.finalizeCallRecord(callSid)
+			removeSession(*callSidPtr)
+			if *callSidPtr != "" && !strings.HasPrefix(*callSidPtr, "pending-") {
+				h.finalizeCallRecord(*callSidPtr)
+			}
 			return
 
 		case <-pingTicker.C:
@@ -495,7 +526,8 @@ func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, 
 }
 
 // handleExotelEvent processes Exotel JSON events (start, media, stop, clear)
-func (h *Handler) handleExotelEvent(conn *websocket.Conn, callSid, from, to string, message []byte, sampleRate int) {
+// callSidPtr is a pointer so we can update it when we get the real call_sid from start event
+func (h *Handler) handleExotelEvent(conn *websocket.Conn, callSidPtr *string, from, to string, message []byte, sampleRate int) {
 	var event ExotelEvent
 	if err := json.Unmarshal(message, &event); err != nil {
 		h.logger.Warn("Failed to parse Exotel event", zap.Error(err), zap.String("raw", string(message)))
@@ -503,20 +535,20 @@ func (h *Handler) handleExotelEvent(conn *websocket.Conn, callSid, from, to stri
 	}
 
 	h.logger.Info("Received Exotel event",
-		zap.String("call_sid", callSid),
+		zap.String("call_sid", *callSidPtr),
 		zap.String("event", event.Event),
 		zap.String("stream_sid", event.StreamSid),
 	)
 
 	switch event.Event {
 	case "start":
-		h.handleStartEvent(conn, callSid, from, to, message, sampleRate)
+		h.handleStartEvent(conn, callSidPtr, from, to, message, sampleRate)
 	case "media":
-		h.handleMediaEvent(conn, callSid, message)
+		h.handleMediaEvent(conn, *callSidPtr, message)
 	case "stop":
-		h.handleStopEvent(callSid, message)
+		h.handleStopEvent(*callSidPtr, message)
 	case "clear":
-		h.handleClearEvent(callSid, message)
+		h.handleClearEvent(*callSidPtr, message)
 	default:
 		h.logger.Debug("Unknown Exotel event", zap.String("event", event.Event))
 	}
@@ -524,15 +556,40 @@ func (h *Handler) handleExotelEvent(conn *websocket.Conn, callSid, from, to stri
 
 // handleStartEvent processes Exotel "start" event
 // On start: create session, extract custom_parameters, trigger greeting TTS
-func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to string, message []byte, sampleRate int) {
+// callSidPtr is a pointer so we can update it if we get call_sid from custom_parameters
+func (h *Handler) handleStartEvent(conn *websocket.Conn, callSidPtr *string, from, to string, message []byte, sampleRate int) {
 	var startEvent StartEvent
 	if err := json.Unmarshal(message, &startEvent); err != nil {
 		h.logger.Warn("Failed to parse start event", zap.Error(err))
 		return
 	}
 
+	// Try to extract call_sid from custom_parameters if we don't have it yet
+	if *callSidPtr == "" || strings.HasPrefix(*callSidPtr, "pending-") {
+		if startEvent.CustomParameters != nil {
+			if callSidVal, ok := startEvent.CustomParameters["call_sid"].(string); ok && callSidVal != "" {
+				oldCallSid := *callSidPtr
+				*callSidPtr = callSidVal
+				h.logger.Info("Extracted call_sid from start event custom_parameters",
+					zap.String("old_call_sid", oldCallSid),
+					zap.String("new_call_sid", *callSidPtr),
+				)
+				// Initialize call record now that we have the real call_sid
+				h.initializeCallRecord(*callSidPtr, from, to)
+			}
+		}
+		// If still no call_sid, try to use stream_sid as fallback
+		if (*callSidPtr == "" || strings.HasPrefix(*callSidPtr, "pending-")) && startEvent.StreamSid != "" {
+			*callSidPtr = startEvent.StreamSid
+			h.logger.Info("Using stream_sid as call_sid fallback",
+				zap.String("call_sid", *callSidPtr),
+			)
+			h.initializeCallRecord(*callSidPtr, from, to)
+		}
+	}
+
 	// Create or get session
-	session := getOrCreateSession(callSid, startEvent.StreamSid, from, to, conn, sampleRate)
+	session := getOrCreateSession(*callSidPtr, startEvent.StreamSid, from, to, conn, sampleRate)
 
 	// Store custom_parameters in session
 	session.Mu.Lock()
@@ -555,18 +612,18 @@ func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to strin
 		customParamsBytes, _ := json.Marshal(startEvent.CustomParameters)
 		customParamsStr := string(customParamsBytes)
 		h.logger.Info("Start event custom_parameters received",
-			zap.String("call_sid", callSid),
+			zap.String("call_sid", *callSidPtr),
 			zap.String("custom_parameters", customParamsStr),
 		)
 	} else {
 		h.logger.Warn("Start event received without custom_parameters",
-			zap.String("call_sid", callSid),
+			zap.String("call_sid", *callSidPtr),
 			zap.String("stream_sid", startEvent.StreamSid),
 		)
 	}
 
 	h.logger.Info("Handling start event, sending greeting",
-		zap.String("call_sid", callSid),
+		zap.String("call_sid", *callSidPtr),
 		zap.String("stream_sid", startEvent.StreamSid),
 		zap.Any("custom_parameters", startEvent.CustomParameters),
 		zap.Int("sample_rate", sampleRate),
