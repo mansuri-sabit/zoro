@@ -67,12 +67,14 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 	if req.CallbackURL != "" {
 		data.Set("StatusCallback", req.CallbackURL)
 	}
-	// No Url parameter - Exotel will dial the target number directly
-	// IMPORTANT: Configure the Exophone in Exotel Dashboard to route all calls to Voicebot Applet
-	// The Applet should be configured with:
-	// 1. WebSocket URL: https://zoro-yvye.onrender.com/voicebot/init
-	// 2. Only Voicebot applet (no Connect applet needed)
-	// The target number (To) will be automatically available in the call context
+
+	// If AppletID is provided, use it to build the Url parameter for Voicebot Applet
+	if req.AppletID != "" && req.AccountSID != "" {
+		// Format: https://{subdomain}.exotel.com/v1/Accounts/{AccountSID}/Applets/{AppletID}/connect
+		appletURL := fmt.Sprintf("https://%s.exotel.com/v1/Accounts/%s/Applets/%s/connect",
+			c.subdomain, req.AccountSID, req.AppletID)
+		data.Set("Url", appletURL)
+	}
 
 	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(data.Encode()))
 	if err != nil {
