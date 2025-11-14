@@ -279,21 +279,32 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		FindOne(ctx)
 
 	// If not found, try with different case or try to find by phone numbers (for outbound calls)
-	if originalCall == nil && req.Direction != "incoming" {
-		// For outbound calls, try to find by matching From/To within last 5 minutes
+	if originalCall == nil {
+		// For outbound calls, try to find by matching From/To within last 2 minutes
 		// This handles timing issues where Exotel calls back before MongoDB indexes
 		normalizedExophone := normalizePhoneNumber(h.cfg.ExotelExophone)
 		normalizedFrom := normalizePhoneNumber(req.From)
 
-		if normalizedFrom == normalizedExophone {
+		// Check if this looks like an outbound call (From = Exophone)
+		if normalizedFrom == normalizedExophone || req.Direction != "incoming" {
 			// This looks like an outbound call - try to find recent call record
+			// Get calls from last 3 minutes to handle timing issues
+			threeMinutesAgo := time.Now().Add(-3 * time.Minute).Format(time.RFC3339)
+
 			recentCalls, _ := h.mongoClient.NewQuery("calls").
-				Select("from_number", "to_number", "direction", "caller_id", "call_sid").
+				Select("from_number", "to_number", "direction", "caller_id", "call_sid", "created_at").
 				Eq("from_number", h.cfg.ExotelExophone).
 				Eq("direction", "outbound").
+				Gte("created_at", threeMinutesAgo).
 				Find(ctx)
 
-			// Find the most recent call that matches (within last 2 minutes)
+			h.logger.Info("Searching for recent outbound calls",
+				zap.String("requested_call_sid", callSidNormalized),
+				zap.Int("found_calls_count", len(recentCalls)),
+				zap.String("exophone", h.cfg.ExotelExophone),
+			)
+
+			// Find the most recent call that matches CallSid (partial match)
 			for _, call := range recentCalls {
 				callSid := getString(call, "call_sid")
 				// Check if CallSid is similar (might have different format)
@@ -302,6 +313,7 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 					h.logger.Info("Found call record by CallSid similarity",
 						zap.String("requested_call_sid", callSidNormalized),
 						zap.String("found_call_sid", callSid),
+						zap.String("found_to_number", getString(call, "to_number")),
 					)
 					break
 				}
@@ -309,10 +321,12 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 
 			// If still not found, use the most recent outbound call as fallback
 			if originalCall == nil && len(recentCalls) > 0 {
-				originalCall = recentCalls[len(recentCalls)-1] // Most recent
+				// Sort by created_at descending and take the first one
+				originalCall = recentCalls[0] // Most recent should be first
 				h.logger.Info("Using most recent outbound call as fallback",
 					zap.String("requested_call_sid", callSidNormalized),
 					zap.String("fallback_call_sid", getString(originalCall, "call_sid")),
+					zap.String("fallback_to_number", getString(originalCall, "to_number")),
 				)
 			}
 		}
@@ -437,6 +451,19 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		}
 	}
 
+	// CRITICAL: If we have original call record, ALWAYS use its to_number (it's the source of truth)
+	if originalCall != nil {
+		originalTo := getString(originalCall, "to_number")
+		if originalTo != "" && normalizePhoneNumber(originalTo) != normalizePhoneNumber(virtualNumber) {
+			targetNumber = originalTo
+			h.logger.Info("Using target number from original call record",
+				zap.String("call_sid", req.CallSid),
+				zap.String("original_to_number", originalTo),
+				zap.String("exotel_to", req.To),
+			)
+		}
+	}
+
 	// Prevent self-call (virtual number calling itself)
 	if normalizePhoneNumber(virtualNumber) == normalizePhoneNumber(targetNumber) {
 		h.logger.Error("Self-call detected - virtual number and target number are same",
@@ -467,19 +494,6 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 						)
 					}
 				}
-			}
-		}
-
-		// 3. Try original call record
-		if normalizePhoneNumber(virtualNumber) == normalizePhoneNumber(targetNumber) && originalCall != nil {
-			// Use original target from database
-			originalTo := getString(originalCall, "to_number")
-			if originalTo != "" && normalizePhoneNumber(originalTo) != normalizePhoneNumber(virtualNumber) {
-				targetNumber = originalTo
-				h.logger.Info("Fixed self-call using original call record",
-					zap.String("call_sid", req.CallSid),
-					zap.String("corrected_target", targetNumber),
-				)
 			}
 		}
 	}

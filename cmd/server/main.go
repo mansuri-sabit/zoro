@@ -555,11 +555,12 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 	// from_number = Virtual Exophone (what made the call)
 	// to_number = Target number (customer)
 	// caller_id = Virtual Exophone (caller ID)
+	// CRITICAL: Save immediately so it's available when Exotel calls back
 	callData := map[string]interface{}{
 		"call_sid":    resp.Call.Sid,
 		"direction":   "outbound",
 		"from_number": req.CallerID, // Virtual Exophone (what made the call)
-		"to_number":   req.To,       // Target number (customer)
+		"to_number":   req.To,       // Target number (customer) - THIS IS CRITICAL
 		"flow_id":     req.FlowID,
 		"caller_id":   req.CallerID, // Virtual Exophone (caller ID)
 		"status":      resp.Call.Status,
@@ -567,7 +568,21 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 		"created_at":  time.Now().Format(time.RFC3339),
 	}
 
-	s.mongoClient.NewQuery("calls").Insert(ctx, callData)
+	// Insert call record immediately
+	_, err = s.mongoClient.NewQuery("calls").Insert(ctx, callData)
+	if err != nil {
+		logger.Log.Error("Failed to save call record - CRITICAL",
+			zap.Error(err),
+			zap.String("call_sid", resp.Call.Sid),
+			zap.String("to_number", req.To),
+		)
+	} else {
+		logger.Log.Info("Call record saved successfully",
+			zap.String("call_sid", resp.Call.Sid),
+			zap.String("to_number", req.To),
+			zap.String("from_number", req.CallerID),
+		)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"call_sid": resp.Call.Sid,
