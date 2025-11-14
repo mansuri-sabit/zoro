@@ -200,6 +200,7 @@ type ExotelVoicebotRequest struct {
 	DialWhomNumber string `json:"DialWhomNumber" form:"DialWhomNumber"` // Target number for outbound calls
 	VirtualNumber  string `json:"VirtualNumber" form:"VirtualNumber"`   // DID that received the call
 	Direction      string `json:"Direction" form:"Direction"`           // incoming/outbound
+	UserData       string `json:"UserData" form:"UserData"`             // Custom data passed to Exotel
 	// Add other Exotel parameters as needed
 }
 
@@ -252,6 +253,9 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	if req.Direction == "" {
 		req.Direction = c.Query("Direction")
 	}
+	if req.UserData == "" {
+		req.UserData = c.Query("UserData")
+	}
 
 	if req.CallSid == "" {
 		h.logger.Warn("ExotelVoicebotEndpoint called without CallSid",
@@ -267,10 +271,52 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
+	// Try to find call record by CallSid (case-insensitive, trimmed)
+	callSidNormalized := strings.TrimSpace(req.CallSid)
 	originalCall, _ := h.mongoClient.NewQuery("calls").
 		Select("from_number", "to_number", "direction", "caller_id").
-		Eq("call_sid", req.CallSid).
+		Eq("call_sid", callSidNormalized).
 		FindOne(ctx)
+
+	// If not found, try with different case or try to find by phone numbers (for outbound calls)
+	if originalCall == nil && req.Direction != "incoming" {
+		// For outbound calls, try to find by matching From/To within last 5 minutes
+		// This handles timing issues where Exotel calls back before MongoDB indexes
+		normalizedExophone := normalizePhoneNumber(h.cfg.ExotelExophone)
+		normalizedFrom := normalizePhoneNumber(req.From)
+
+		if normalizedFrom == normalizedExophone {
+			// This looks like an outbound call - try to find recent call record
+			recentCalls, _ := h.mongoClient.NewQuery("calls").
+				Select("from_number", "to_number", "direction", "caller_id", "call_sid").
+				Eq("from_number", h.cfg.ExotelExophone).
+				Eq("direction", "outbound").
+				Find(ctx)
+
+			// Find the most recent call that matches (within last 2 minutes)
+			for _, call := range recentCalls {
+				callSid := getString(call, "call_sid")
+				// Check if CallSid is similar (might have different format)
+				if strings.Contains(callSid, callSidNormalized) || strings.Contains(callSidNormalized, callSid) {
+					originalCall = call
+					h.logger.Info("Found call record by CallSid similarity",
+						zap.String("requested_call_sid", callSidNormalized),
+						zap.String("found_call_sid", callSid),
+					)
+					break
+				}
+			}
+
+			// If still not found, use the most recent outbound call as fallback
+			if originalCall == nil && len(recentCalls) > 0 {
+				originalCall = recentCalls[len(recentCalls)-1] // Most recent
+				h.logger.Info("Using most recent outbound call as fallback",
+					zap.String("requested_call_sid", callSidNormalized),
+					zap.String("fallback_call_sid", getString(originalCall, "call_sid")),
+				)
+			}
+		}
+	}
 
 	var virtualNumber, targetNumber, callerNumber string
 	var isOutbound bool
@@ -400,14 +446,32 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 			zap.String("exotel_from", req.From),
 			zap.String("exotel_to", req.To),
 		)
-		// Try to get correct target from DialWhomNumber
+		// Try to get correct target from multiple sources
+		// 1. Try DialWhomNumber
 		if req.DialWhomNumber != "" && normalizePhoneNumber(req.DialWhomNumber) != normalizePhoneNumber(virtualNumber) {
 			targetNumber = req.DialWhomNumber
 			h.logger.Info("Fixed self-call using DialWhomNumber",
 				zap.String("call_sid", req.CallSid),
 				zap.String("corrected_target", targetNumber),
 			)
-		} else if originalCall != nil {
+		} else if req.UserData != "" {
+			// 2. Try to extract from UserData (we sent target_number in UserData)
+			var userDataMap map[string]interface{}
+			if err := json.Unmarshal([]byte(req.UserData), &userDataMap); err == nil {
+				if targetFromUserData, ok := userDataMap["target_number"].(string); ok && targetFromUserData != "" {
+					if normalizePhoneNumber(targetFromUserData) != normalizePhoneNumber(virtualNumber) {
+						targetNumber = targetFromUserData
+						h.logger.Info("Fixed self-call using UserData",
+							zap.String("call_sid", req.CallSid),
+							zap.String("corrected_target", targetNumber),
+						)
+					}
+				}
+			}
+		}
+
+		// 3. Try original call record
+		if normalizePhoneNumber(virtualNumber) == normalizePhoneNumber(targetNumber) && originalCall != nil {
 			// Use original target from database
 			originalTo := getString(originalCall, "to_number")
 			if originalTo != "" && normalizePhoneNumber(originalTo) != normalizePhoneNumber(virtualNumber) {

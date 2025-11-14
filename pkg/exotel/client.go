@@ -89,6 +89,12 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 		data.Set("To", req.To)             // Target number (customer we're calling)
 		data.Set("CallerId", req.CallerID) // Virtual Exophone (caller ID)
 		data.Set("CallType", req.CallType)
+
+		// CRITICAL: For Voicebot Applets, also pass target number in UserData
+		// This ensures Exotel preserves it even if To parameter is ignored
+		if req.To != "" {
+			data.Set("UserData", fmt.Sprintf(`{"target_number":"%s"}`, req.To))
+		}
 		// Note: Url is not set here - Exotel uses Applet configuration
 	} else {
 		// Regular call (non-Voicebot)
@@ -109,6 +115,12 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 
 	httpReq.SetBasicAuth(c.apiKey, c.apiToken)
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	// Log the request for debugging (without sensitive data)
+	// Extract From value from data for logging
+	logFrom := data.Get("From")
+	fmt.Printf("[Exotel ConnectCall] From=%s, To=%s, CallerId=%s, AppletID=%s\n",
+		logFrom, data.Get("To"), data.Get("CallerId"), req.AppletID)
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
