@@ -307,45 +307,28 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 }
 
 // createWebSocketUpgrader creates a secure WebSocket upgrader with origin validation
+// Per requirements: No authentication required (direct connect)
 func createWebSocketUpgrader(cfg *env.Config) websocket.Upgrader {
 	return websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			origin := r.Header.Get("Origin")
 
-			// In development, allow all origins
-			if cfg.AppEnv == "development" {
-				return true
+			// Per requirements: No authentication, allow all connections
+			// Exotel WebSocket connections may not send origin header or may use different origins
+			// Log origin for debugging but allow all connections
+			if origin != "" {
+				logger.Log.Info("WebSocket connection from origin",
+					zap.String("origin", origin),
+					zap.String("remote_addr", r.RemoteAddr),
+					zap.String("path", r.URL.Path),
+				)
 			}
 
-			// In production, validate Exotel origins
-			// Exotel WebSocket connections come from their infrastructure
-			// Allow common Exotel domains and your own domain
-			allowedOrigins := []string{
-				"https://my.exotel.com",
-				"https://api.exotel.com",
-				"https://" + cfg.ExotelSubdomain + ".exotel.com",
-			}
-
-			// Also allow if origin matches our base URL
-			if cfg.VoicebotBaseURL != "" {
-				allowedOrigins = append(allowedOrigins, cfg.VoicebotBaseURL)
-			}
-
-			for _, allowed := range allowedOrigins {
-				if origin == allowed || origin == "" {
-					return true
-				}
-			}
-
-			// Log rejected origins for security monitoring
-			logger.Log.Warn("WebSocket connection rejected - invalid origin",
-				zap.String("origin", origin),
-				zap.String("remote_addr", r.RemoteAddr),
-			)
-			return false
+			// Allow all origins (no authentication as per requirements)
+			return true
 		},
-		ReadBufferSize:  4096,
-		WriteBufferSize: 4096,
+		ReadBufferSize:  8192, // Increased for better performance
+		WriteBufferSize: 8192, // Increased for better performance
 		// Enable compression for better performance
 		EnableCompression: true,
 	}
@@ -371,6 +354,10 @@ func (h *Handler) VoicebotWebSocket(c *gin.Context) {
 	if sampleRateStr != "" {
 		if sr, err := strconv.Atoi(sampleRateStr); err == nil && sr > 0 {
 			sampleRate = sr
+			h.logger.Info("Sample rate from query parameter",
+				zap.Int("sample_rate", sampleRate),
+				zap.String("call_sid", callSid),
+			)
 		}
 	}
 	// Enforce 16kHz as mandatory requirement
@@ -562,6 +549,21 @@ func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to strin
 
 	session.GreetingSent = true
 	session.Mu.Unlock()
+
+	// Log custom_parameters for debugging
+	if len(startEvent.CustomParameters) > 0 {
+		customParamsBytes, _ := json.Marshal(startEvent.CustomParameters)
+		customParamsStr := string(customParamsBytes)
+		h.logger.Info("Start event custom_parameters received",
+			zap.String("call_sid", callSid),
+			zap.String("custom_parameters", customParamsStr),
+		)
+	} else {
+		h.logger.Warn("Start event received without custom_parameters",
+			zap.String("call_sid", callSid),
+			zap.String("stream_sid", startEvent.StreamSid),
+		)
+	}
 
 	h.logger.Info("Handling start event, sending greeting",
 		zap.String("call_sid", callSid),
@@ -893,7 +895,7 @@ func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName
 
 		mediaEvent := map[string]interface{}{
 			"event":           "media",
-			"stream_sid":       streamSid,
+			"stream_sid":      streamSid,
 			"sequence_number": fmt.Sprintf("%d", i), // Start at 0, increment per chunk
 			"media": map[string]interface{}{
 				"payload": base64Payload,
@@ -1277,4 +1279,3 @@ func (h *Handler) finalizeCallRecord(callSid string) {
 
 	h.logger.Info("Call record finalized", zap.String("call_sid", callSid))
 }
-
