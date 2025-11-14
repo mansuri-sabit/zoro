@@ -257,6 +257,17 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		req.UserData = c.Query("UserData")
 	}
 
+	// CRITICAL: Check for target_number parameter from Exotel Applet URL configuration
+	// When Applet URL is configured as: https://zoro-yvye.onrender.com/voicebot/init?target_number={{To}}
+	// This parameter will contain the correct target number even if Exotel sends wrong To parameter
+	targetNumberFromURL := c.Query("target_number")
+	if targetNumberFromURL != "" {
+		h.logger.Info("Found target_number in URL parameter (from Exotel Applet configuration)",
+			zap.String("target_number", targetNumberFromURL),
+			zap.String("call_sid", req.CallSid),
+		)
+	}
+
 	if req.CallSid == "" {
 		h.logger.Warn("ExotelVoicebotEndpoint called without CallSid",
 			zap.String("method", c.Request.Method),
@@ -468,8 +479,21 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		}
 	}
 
-	// CRITICAL: If we have original call record, ALWAYS use its to_number (it's the source of truth)
-	if originalCall != nil {
+	// CRITICAL: Priority order for target number:
+	// 1. target_number from URL parameter (from Exotel Applet configuration) - HIGHEST PRIORITY
+	// 2. Original call record's to_number
+	// 3. Other fallback methods
+
+	// Priority 1: Use target_number from URL parameter if available (from Exotel Applet URL config)
+	if targetNumberFromURL != "" && normalizePhoneNumber(targetNumberFromURL) != normalizePhoneNumber(virtualNumber) {
+		targetNumber = targetNumberFromURL
+		h.logger.Info("Using target number from URL parameter (Exotel Applet configuration)",
+			zap.String("call_sid", req.CallSid),
+			zap.String("target_number_from_url", targetNumberFromURL),
+			zap.String("exotel_to", req.To),
+		)
+	} else if originalCall != nil {
+		// Priority 2: Use original call record's to_number (it's the source of truth)
 		originalTo := getString(originalCall, "to_number")
 		if originalTo != "" && normalizePhoneNumber(originalTo) != normalizePhoneNumber(virtualNumber) {
 			targetNumber = originalTo
