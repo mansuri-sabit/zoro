@@ -204,17 +204,45 @@ type VoicebotWebSocketResponse struct {
 
 // ExotelVoicebotEndpoint handles Exotel Voicebot initialization
 // Exotel calls this endpoint when a call starts to get the WebSocket URL
+// Supports both GET (query params) and POST (form/json) requests
 func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	var req ExotelVoicebotRequest
+
+	// Try to bind from query params (GET) or form/json (POST)
 	if err := c.ShouldBind(&req); err != nil {
-		errors.BadRequest(c, "invalid payload")
-		return
+		// If binding fails, try to get from query params directly
+		req.CallSid = c.Query("CallSid")
+		req.From = c.Query("From")
+		req.To = c.Query("To")
+	}
+
+	// Also try alternative parameter names
+	if req.CallSid == "" {
+		req.CallSid = c.Query("call_sid")
+	}
+	if req.From == "" {
+		req.From = c.Query("CallFrom")
+	}
+	if req.To == "" {
+		req.To = c.Query("CallTo")
 	}
 
 	if req.CallSid == "" {
+		h.logger.Warn("ExotelVoicebotEndpoint called without CallSid",
+			zap.String("method", c.Request.Method),
+			zap.String("url", c.Request.URL.String()),
+			zap.Any("query", c.Request.URL.Query()),
+		)
 		errors.BadRequest(c, "CallSid is required")
 		return
 	}
+
+	h.logger.Info("ExotelVoicebotEndpoint called",
+		zap.String("call_sid", req.CallSid),
+		zap.String("from", req.From),
+		zap.String("to", req.To),
+		zap.String("method", c.Request.Method),
+	)
 
 	// Get base URL - prefer configured URL, fallback to request-based detection
 	baseURL := h.cfg.VoicebotBaseURL

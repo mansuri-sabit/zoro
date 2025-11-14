@@ -69,9 +69,13 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 	}
 	// Add Applet ID for voicebot calls using Url parameter
 	// Format: http://my.exotel.com/{account_sid}/exoml/start_voice/{applet_id}
+	// Note: This routes the call to the specified Applet, which should be configured
+	// with the WebSocket URL in Exotel Dashboard
 	if req.AppletID != "" && req.AccountSID != "" {
 		voicebotURL := fmt.Sprintf("http://my.exotel.com/%s/exoml/start_voice/%s", req.AccountSID, req.AppletID)
 		data.Set("Url", voicebotURL)
+		// Log the URL being sent for debugging
+		fmt.Printf("[DEBUG] Exotel Voicebot URL: %s\n", voicebotURL)
 	}
 
 	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(data.Encode()))
@@ -240,4 +244,52 @@ func (c *Client) CancelCampaign(campaignID string) error {
 	}
 
 	return nil
+}
+
+// GetCallStatus gets the status of a call from Exotel API
+func (c *Client) GetCallStatus(callSID string) (*CallStatusResponse, error) {
+	endpoint := fmt.Sprintf("https://%s.exotel.com/v1/Accounts/%s/Calls/%s.json",
+		c.subdomain, c.accountSID, callSID)
+
+	httpReq, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.SetBasicAuth(c.apiKey, c.apiToken)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("exotel API error: %s (status %d)", string(body), resp.StatusCode)
+	}
+
+	var result CallStatusResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &result, nil
+}
+
+type CallStatusResponse struct {
+	Call struct {
+		Sid       string `json:"Sid"`
+		Status    string `json:"Status"`
+		Direction string `json:"Direction"`
+		From      string `json:"From"`
+		To        string `json:"To"`
+		StartTime string `json:"StartTime"`
+		EndTime   string `json:"EndTime"`
+		Duration  string `json:"Duration"`
+	} `json:"Call"`
 }

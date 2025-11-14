@@ -428,6 +428,8 @@ func (s *UnifiedServer) setupRouter() *gin.Engine {
 	router.POST("/webhooks/exotel", s.ProcessWebhook)
 
 	// Exotel Voicebot endpoints (public, no auth)
+	// Support both GET and POST for /voicebot/init (Exotel may use either)
+	router.GET("/voicebot/init", s.handler.ExotelVoicebotEndpoint)
 	router.POST("/voicebot/init", s.handler.ExotelVoicebotEndpoint)
 	router.GET("/voicebot/ws", s.handler.VoicebotWebSocket)
 
@@ -518,7 +520,8 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 			zap.Error(err),
 			zap.String("from", req.From),
 			zap.String("to", req.To),
-			zap.String("applet_id", req.FlowID),
+			zap.String("applet_id", appletID),
+			zap.String("account_sid", s.cfg.ExotelAccountSID),
 		)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "failed to initiate call",
@@ -526,6 +529,16 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 		})
 		return
 	}
+
+	// Log successful call initiation with details
+	logger.Log.Info("Call initiated successfully",
+		zap.String("call_sid", resp.Call.Sid),
+		zap.String("status", resp.Call.Status),
+		zap.String("direction", resp.Call.Direction),
+		zap.String("from", req.From),
+		zap.String("to", req.To),
+		zap.String("applet_id", appletID),
+	)
 
 	callData := map[string]interface{}{
 		"call_sid":    resp.Call.Sid,
