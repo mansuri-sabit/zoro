@@ -61,19 +61,19 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 
 	data := url.Values{}
 	data.Set("From", req.From)
-	data.Set("To", req.To) // Target number - Exotel will dial this directly (dynamic)
+	data.Set("To", req.To) // Target number - Exotel will dial this directly
 	data.Set("CallerId", req.CallerID)
 	data.Set("CallType", req.CallType)
 	if req.CallbackURL != "" {
 		data.Set("StatusCallback", req.CallbackURL)
 	}
 
-	// If AppletID is provided, use it to build the Url parameter for Voicebot Applet
-	if req.AppletID != "" && req.AccountSID != "" {
-		// Format: https://{subdomain}.exotel.com/v1/Accounts/{AccountSID}/Applets/{AppletID}/connect
-		appletURL := fmt.Sprintf("https://%s.exotel.com/v1/Accounts/%s/Applets/%s/connect",
-			c.subdomain, req.AccountSID, req.AppletID)
-		data.Set("Url", appletURL)
+	// For Voicebot Applets: Don't set Url parameter - let Exotel dial the target number directly
+	// When AppletID is provided, pass it as CustomField so Exotel can route through the Applet
+	// The Applet should be configured in Exotel Dashboard with your voicebot init endpoint
+	if req.AppletID != "" {
+		// Pass Applet ID as CustomField - Exotel may use this for routing
+		data.Set("CustomField", req.AppletID)
 	}
 
 	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(data.Encode()))

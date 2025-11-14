@@ -286,8 +286,8 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		}
 	}
 
-	// WebSocket endpoint with call parameters
-	wsURL := fmt.Sprintf("%s/voicebot/ws?call_sid=%s&from=%s&to=%s",
+	// WebSocket endpoint with call parameters - use /was as per requirements
+	wsURL := fmt.Sprintf("%s/was?sample-rate=16000&call_sid=%s&from=%s&to=%s",
 		wsBaseURL,
 		req.CallSid,
 		req.From,
@@ -365,13 +365,21 @@ func (h *Handler) VoicebotWebSocket(c *gin.Context) {
 	from := c.Query("from")
 	to := c.Query("to")
 
-	// Get sample-rate from query parameter (default 16000)
+	// Get sample-rate from query parameter - 16kHz is mandatory
 	sampleRateStr := c.Query("sample-rate")
 	sampleRate := 16000 // Default 16kHz
 	if sampleRateStr != "" {
 		if sr, err := strconv.Atoi(sampleRateStr); err == nil && sr > 0 {
 			sampleRate = sr
 		}
+	}
+	// Enforce 16kHz as mandatory requirement
+	if sampleRate != 16000 {
+		h.logger.Warn("Invalid sample rate, enforcing 16kHz",
+			zap.Int("requested", sampleRate),
+			zap.String("call_sid", callSid),
+		)
+		sampleRate = 16000
 	}
 
 	if callSid == "" {
@@ -399,6 +407,7 @@ func (h *Handler) VoicebotWebSocket(c *gin.Context) {
 		zap.String("call_sid", callSid),
 		logger.MaskPhoneIfPresent("from", from),
 		logger.MaskPhoneIfPresent("to", to),
+		zap.Int("sample_rate", sampleRate),
 	)
 
 	// Create or update call record in database
@@ -567,7 +576,14 @@ func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to strin
 
 // sendGreeting sends TTS greeting to Exotel in chunked PCM format
 func (h *Handler) sendGreeting(session *VoiceSession) {
+	// Get greeting text from custom_parameters or use default
 	greetingText := "Hello! How can I help you today?"
+	if session.CustomParameters != nil {
+		if gt, ok := session.CustomParameters["greeting_text"].(string); ok && gt != "" {
+			greetingText = gt
+		}
+	}
+
 	if !h.cfg.FeatureAI || h.cfg.OpenAIApiKey == "" {
 		// Fallback: send text response
 		h.sendTextResponse(session, greetingText)
@@ -871,13 +887,14 @@ func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName
 	}
 
 	// Send each chunk as Exotel media event with base64-encoded payload
-	for _, chunk := range chunks {
+	for i, chunk := range chunks {
 		// Base64 encode the PCM chunk
 		base64Payload := audio.EncodePCMChunkToBase64(chunk)
 
 		mediaEvent := map[string]interface{}{
-			"event":      "media",
-			"stream_sid": streamSid,
+			"event":           "media",
+			"stream_sid":       streamSid,
+			"sequence_number": fmt.Sprintf("%d", i), // Start at 0, increment per chunk
 			"media": map[string]interface{}{
 				"payload": base64Payload,
 			},
@@ -1260,3 +1277,4 @@ func (h *Handler) finalizeCallRecord(callSid string) {
 
 	h.logger.Info("Call record finalized", zap.String("call_sid", callSid))
 }
+
