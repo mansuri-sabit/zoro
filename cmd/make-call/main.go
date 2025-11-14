@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -18,8 +19,25 @@ func main() {
 		baseURL = url
 	}
 
+	// Get phone number from command line or use default
+	targetNumber := "+919324606985"
+	if len(os.Args) > 1 {
+		targetNumber = os.Args[1]
+		// Remove spaces and ensure +91 format
+		targetNumber = strings.ReplaceAll(targetNumber, " ", "")
+		if !strings.HasPrefix(targetNumber, "+") {
+			if strings.HasPrefix(targetNumber, "91") {
+				targetNumber = "+" + targetNumber
+			} else if strings.HasPrefix(targetNumber, "0") {
+				targetNumber = "+91" + targetNumber[1:]
+			} else {
+				targetNumber = "+91" + targetNumber
+			}
+		}
+	}
+
 	fmt.Println("========================================")
-	fmt.Println("Making Call to +919324606985")
+	fmt.Printf("Making Call to %s\n", targetNumber)
 	fmt.Println("========================================")
 	fmt.Println()
 
@@ -78,7 +96,7 @@ func main() {
 	fmt.Println("Step 2: Initiating call...")
 	callData := map[string]interface{}{
 		"from":    "+917948516111", // Exotel Exophone
-		"to":      "+919324606985", // Target number
+		"to":      targetNumber,    // Target number
 		"flow_id": "1116870",       // Exotel Applet ID
 	}
 

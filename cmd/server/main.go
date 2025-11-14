@@ -496,18 +496,34 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 		return
 	}
 
+	// Use flow_id if provided, otherwise use configured Applet ID
+	appletID := req.FlowID
+	if appletID == "" {
+		appletID = s.cfg.ExotelVoicebotAppletID
+	}
+
 	callReq := exotel.ConnectCallRequest{
 		From:        req.From,
 		To:          req.To,
 		CallerID:    req.CallerID,
 		CallType:    "trans",
 		CallbackURL: "",
+		AppletID:    appletID,               // Use flow_id or configured Applet ID for voicebot
+		AccountSID:  s.cfg.ExotelAccountSID, // Required for building voicebot URL
 	}
 
 	resp, err := s.exotelClient.ConnectCall(callReq)
 	if err != nil {
-		logger.Log.Error("Failed to initiate call", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate call"})
+		logger.Log.Error("Failed to initiate call",
+			zap.Error(err),
+			zap.String("from", req.From),
+			zap.String("to", req.To),
+			zap.String("applet_id", req.FlowID),
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "failed to initiate call",
+			"details": err.Error(),
+		})
 		return
 	}
 
@@ -604,18 +620,34 @@ func (s *UnifiedServer) CreateCall(c *gin.Context) {
 		return
 	}
 
+	// Use flow_id if provided, otherwise use configured Applet ID
+	appletID := internalReq.FlowID
+	if appletID == "" {
+		appletID = s.cfg.ExotelVoicebotAppletID
+	}
+
 	callReq := exotel.ConnectCallRequest{
 		From:        internalReq.From,
 		To:          internalReq.To,
 		CallerID:    internalReq.CallerID,
 		CallType:    "trans",
 		CallbackURL: "",
+		AppletID:    appletID,               // Use flow_id or configured Applet ID for voicebot
+		AccountSID:  s.cfg.ExotelAccountSID, // Required for building voicebot URL
 	}
 
 	resp, err := s.exotelClient.ConnectCall(callReq)
 	if err != nil {
-		logger.Log.Error("Failed to initiate call", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate call"})
+		logger.Log.Error("Failed to initiate call",
+			zap.Error(err),
+			zap.String("from", internalReq.From),
+			zap.String("to", internalReq.To),
+			zap.String("applet_id", internalReq.FlowID),
+		)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "failed to initiate call",
+			"details": err.Error(),
+		})
 		return
 	}
 
@@ -866,7 +898,7 @@ func (s *UnifiedServer) processCampaigns(ctx context.Context) {
 			callData := map[string]interface{}{
 				"call_sid":    resp.Call.Sid,
 				"direction":   "outbound",
-				"from_number":  s.cfg.ExotelExophone,
+				"from_number": s.cfg.ExotelExophone,
 				"to_number":   phone,
 				"flow_id":     flowID,
 				"caller_id":   s.cfg.ExotelExophone,
@@ -926,7 +958,7 @@ func (s *UnifiedServer) ProcessWebhook(c *gin.Context) {
 	// Idempotency check using Redis (TTL: 24 hours)
 	ctx := context.Background()
 	idempotencyKey := fmt.Sprintf("webhook:exotel:%s", callSid)
-	
+
 	// Check if already processed
 	exists, err := s.redisClient.Exists(ctx, idempotencyKey).Result()
 	if err == nil && exists > 0 {
@@ -998,15 +1030,15 @@ func (s *UnifiedServer) processWebhookPayload(ctx context.Context, payload *Exot
 
 	// Upsert call record (idempotent by CallSid)
 	callData := map[string]interface{}{
-		"call_sid":          payload.CallSid,
-		"from_number":       payload.From,
-		"to_number":         payload.To,
-		"direction":         payload.Direction,
-		"status":            payload.Status,
-		"started_at":        startedAt,
-		"ended_at":          endedAt,
-		"duration_sec":      durationSec,
-		"recording_url":     payload.RecordingUrl,
+		"call_sid":            payload.CallSid,
+		"from_number":         payload.From,
+		"to_number":           payload.To,
+		"direction":           payload.Direction,
+		"status":              payload.Status,
+		"started_at":          startedAt,
+		"ended_at":            endedAt,
+		"duration_sec":        durationSec,
+		"recording_url":       payload.RecordingUrl,
 		"webhook_received_at": time.Now().Format(time.RFC3339),
 	}
 
@@ -1057,7 +1089,7 @@ func (s *UnifiedServer) processWebhookPayload(ctx context.Context, payload *Exot
 			s.mongoClient.NewQuery("campaign_contacts").
 				Eq("call_sid", payload.CallSid).
 				UpdateOne(ctx, map[string]interface{}{
-					"status":     "skipped",
+					"status":      "skipped",
 					"disposition": "opt_out",
 				})
 		}
@@ -1068,18 +1100,17 @@ func (s *UnifiedServer) processWebhookPayload(ctx context.Context, payload *Exot
 		s.mongoClient.NewQuery("campaign_contacts").
 			Eq("call_sid", payload.CallSid).
 			UpdateOne(ctx, map[string]interface{}{
-				"status":     "completed",
+				"status":      "completed",
 				"disposition": "answered",
 			})
 	} else if payload.Status == "no-answer" || payload.Status == "busy" || payload.Status == "failed" {
 		s.mongoClient.NewQuery("campaign_contacts").
 			Eq("call_sid", payload.CallSid).
 			UpdateOne(ctx, map[string]interface{}{
-				"status":     "failed",
+				"status":      "failed",
 				"disposition": payload.Status,
 			})
 	}
 
 	return nil
 }
-

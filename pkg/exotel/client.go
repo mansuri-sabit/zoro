@@ -34,6 +34,8 @@ type ConnectCallRequest struct {
 	CallerID    string
 	CallType    string
 	CallbackURL string
+	AppletID    string // Applet ID for voicebot calls - will be converted to Url parameter
+	AccountSID  string // Account SID for building voicebot URL
 }
 
 type ConnectCallResponse struct {
@@ -55,6 +57,12 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 	data.Set("CallType", req.CallType)
 	if req.CallbackURL != "" {
 		data.Set("StatusCallback", req.CallbackURL)
+	}
+	// Add Applet ID for voicebot calls using Url parameter
+	// Format: http://my.exotel.com/{account_sid}/exoml/start_voice/{applet_id}
+	if req.AppletID != "" && req.AccountSID != "" {
+		voicebotURL := fmt.Sprintf("http://my.exotel.com/%s/exoml/start_voice/%s", req.AccountSID, req.AppletID)
+		data.Set("Url", voicebotURL)
 	}
 
 	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(data.Encode()))
