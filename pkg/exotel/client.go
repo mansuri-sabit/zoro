@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -18,9 +19,17 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// normalizeSubdomain removes .exotel.com if already present in subdomain
+func normalizeSubdomain(subdomain string) string {
+	if strings.Contains(subdomain, ".exotel.com") {
+		return strings.ReplaceAll(subdomain, ".exotel.com", "")
+	}
+	return subdomain
+}
+
 func NewClient(subdomain, accountSID, apiKey, apiToken string) *Client {
 	return &Client{
-		subdomain:  subdomain,
+		subdomain:  normalizeSubdomain(subdomain),
 		accountSID: accountSID,
 		apiKey:     apiKey,
 		apiToken:   apiToken,
