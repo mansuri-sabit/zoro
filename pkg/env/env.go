@@ -46,20 +46,21 @@ type Config struct {
 	ElevenLabsModel        string
 	ElevenLabsOutputFormat string
 
-	// STT Service (OpenAI Whisper)
+	// STT Service (OpenAI Whisper / Deepgram)
 	WhisperModel    string
 	WhisperLanguage string
+	DeepgramApiKey  string
 
-	ExotelSubdomain     string
-	ExotelAccountSID    string
-	ExotelAPIKey        string
-	ExotelAPIToken      string
-	ExotelExophone      string
-	ExotelFlowURL       string
+	ExotelSubdomain        string
+	ExotelAccountSID       string
+	ExotelAPIKey           string
+	ExotelAPIToken         string
+	ExotelExophone         string
+	ExotelFlowURL          string
 	ExotelVoicebotAppletID string
-	ExotelWebhookSecret string
-	ExotelVoicebotToken string // Bearer token for WebSocket authentication (optional)
-	VoicebotBaseURL     string // Public WSS URL for Exotel (e.g., https://api.example.com)
+	ExotelWebhookSecret    string
+	ExotelVoicebotToken    string // Bearer token for WebSocket authentication (optional)
+	VoicebotBaseURL        string // Public WSS URL for Exotel (e.g., https://api.example.com)
 
 	DialBusinessStartHour int
 	DialBusinessEndHour   int
@@ -131,20 +132,21 @@ func Load(envFile string) (*Config, error) {
 		ElevenLabsModel:        getEnv("ELEVENLABS_MODEL", "eleven_multilingual_v2"),
 		ElevenLabsOutputFormat: getEnv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128"),
 
-		// STT Service (OpenAI Whisper)
+		// STT Service (OpenAI Whisper / Deepgram)
 		WhisperModel:    getEnv("WHISPER_MODEL", "whisper-1"),
 		WhisperLanguage: getEnv("WHISPER_LANGUAGE", ""),
+		DeepgramApiKey:  getEnv("DEEPGRAM_API_KEY", ""),
 
-		ExotelSubdomain:     getEnv("EXOTEL_SUBDOMAIN", "api"),
-		ExotelAccountSID:    getEnv("EXOTEL_ACCOUNT_SID", ""),
-		ExotelAPIKey:        getEnv("EXOTEL_API_KEY", ""),
-		ExotelAPIToken:      getEnv("EXOTEL_API_TOKEN", ""),
-		ExotelExophone:      getEnv("EXOTEL_EXOPHONE", ""),
-		ExotelFlowURL:       getEnv("EXOTEL_FLOW_URL", ""),
+		ExotelSubdomain:        getEnv("EXOTEL_SUBDOMAIN", "api"),
+		ExotelAccountSID:       getEnv("EXOTEL_ACCOUNT_SID", ""),
+		ExotelAPIKey:           getEnv("EXOTEL_API_KEY", ""),
+		ExotelAPIToken:         getEnv("EXOTEL_API_TOKEN", ""),
+		ExotelExophone:         getEnv("EXOTEL_EXOPHONE", ""),
+		ExotelFlowURL:          getEnv("EXOTEL_FLOW_URL", ""),
 		ExotelVoicebotAppletID: getEnv("EXOTEL_VOICEBOT_APPLET_ID", ""),
-		ExotelWebhookSecret: getEnv("EXOTEL_WEBHOOK_SIGNATURE_SECRET", ""),
-		ExotelVoicebotToken: getEnv("EXOTEL_VOICEBOT_TOKEN", ""), // Bearer token for WebSocket auth (set in Exotel dashboard)
-		VoicebotBaseURL:     getEnv("VOICEBOT_BASE_URL", ""), // Public HTTPS URL for WSS (e.g., https://api.example.com)
+		ExotelWebhookSecret:    getEnv("EXOTEL_WEBHOOK_SIGNATURE_SECRET", ""),
+		ExotelVoicebotToken:    getEnv("EXOTEL_VOICEBOT_TOKEN", ""), // Bearer token for WebSocket auth (set in Exotel dashboard)
+		VoicebotBaseURL:        getEnv("VOICEBOT_BASE_URL", ""),     // Public HTTPS URL for WSS (e.g., https://api.example.com)
 
 		DialBusinessStartHour: getEnvInt("DIAL_BUSINESS_START_HOUR", 9),
 		DialBusinessEndHour:   getEnvInt("DIAL_BUSINESS_END_HOUR", 21),

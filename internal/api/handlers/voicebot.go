@@ -22,6 +22,7 @@ import (
 	"github.com/troikatech/calling-agent/pkg/env"
 	"github.com/troikatech/calling-agent/pkg/errors"
 	"github.com/troikatech/calling-agent/pkg/logger"
+	"github.com/troikatech/calling-agent/pkg/stt"
 	"github.com/troikatech/calling-agent/pkg/validation"
 )
 
@@ -918,28 +919,33 @@ func (h *Handler) sendGreeting(session *VoiceSession) {
 		}
 	}
 
-	// Use OpenAI TTS service
+	// CRITICAL FIX: Use OpenAI TTS with PCM16 format
 	openAITTS := ai.NewOpenAITTSService(h.cfg.OpenAIApiKey, 10*time.Second, h.logger)
 	ttsReq := &ai.OpenAITTSRequest{
 		Text:   greetingText,
 		Model:  "tts-1-hd", // Best quality
 		Voice:  voice,
-		Format: "mp3",
+		Format: "pcm", // Request raw PCM16 format (24kHz output)
 		Speed:  1.0,
 	}
 
-	pcmData, err := openAITTS.TextToSpeechPCM(ctx, ttsReq)
+	// Get PCM16 audio (24kHz from OpenAI)
+	pcm24k, err := openAITTS.TextToSpeechPCM(ctx, ttsReq)
 	if err != nil {
 		h.logger.Warn("OpenAI TTS greeting failed", zap.Error(err))
 		h.sendTextResponse(session, greetingText)
 		return
 	}
 
-	// Stream PCM in 640-byte chunks
-	h.streamPCMAudio(session, pcmData, "greeting_done")
+	// Resample 24kHz → 16kHz for Exotel
+	pcm16k := h.resample24kTo16k(pcm24k)
+
+	// Stream PCM in 640-byte chunks (20ms frames at 16kHz)
+	h.streamPCMAudio(session, pcm16k, "greeting_done")
 }
 
-// handleMediaEvent processes Exotel "media" event with base64-encoded PCM audio
+// handleMediaEvent processes Exotel "media" event with base64-encoded G.711 μ-law audio
+// CRITICAL FIX: Exotel sends G.711 μ-law (8kHz), NOT PCM16
 func (h *Handler) handleMediaEvent(conn *websocket.Conn, callSid string, message []byte) {
 	var mediaEvent MediaEvent
 	if err := json.Unmarshal(message, &mediaEvent); err != nil {
@@ -953,15 +959,22 @@ func (h *Handler) handleMediaEvent(conn *websocket.Conn, callSid string, message
 		return
 	}
 
-	// Decode base64 PCM audio
-	pcmData, err := audio.DecodeBase64PCM(mediaEvent.Media.Payload)
+	// CRITICAL FIX: Exotel sends G.711 μ-law (8-bit, 8kHz), NOT PCM16
+	// Step 1: Decode base64 to get μ-law bytes
+	muLawData, err := audio.DecodeBase64PCM(mediaEvent.Media.Payload)
 	if err != nil {
-		h.logger.Warn("Failed to decode base64 PCM", zap.Error(err))
+		h.logger.Warn("Failed to decode base64 μ-law", zap.Error(err))
 		return
 	}
 
-	// Append to audio buffer
-	session.AudioBuffer.Append(pcmData)
+	// Step 2: Decode μ-law to PCM16 (8kHz)
+	pcm8k := audio.DecodeMuLawToPCM16(muLawData)
+
+	// Step 3: Resample 8kHz → 16kHz (Deepgram requires 16kHz)
+	pcm16k := audio.Resample8kTo16k(pcm8k)
+
+	// Append resampled PCM16 (16kHz) to audio buffer
+	session.AudioBuffer.Append(pcm16k)
 
 	// Process if buffer is ready (utterance detection)
 	if session.AudioBuffer.IsReady() {
@@ -1031,14 +1044,63 @@ func (h *Handler) processAudioBuffer(session *VoiceSession) {
 	h.sendTTSResponse(session, aiResponse)
 }
 
-// callSTTService calls OpenAI Whisper to convert audio to text
+// callSTTService calls Deepgram to convert audio to text
+// CRITICAL FIX: Use Deepgram STT with raw PCM16 (16kHz, mono, little-endian)
 func (h *Handler) callSTTService(session *VoiceSession, audioData []byte) string {
-	if !h.cfg.FeatureAI || h.cfg.OpenAIApiKey == "" {
+	if !h.cfg.FeatureAI || h.cfg.DeepgramApiKey == "" {
+		// Fallback to OpenAI Whisper if Deepgram not configured
+		if h.cfg.OpenAIApiKey == "" {
+			return ""
+		}
+		return h.callSTTServiceWhisper(session, audioData)
+	}
+
+	// Use Deepgram STT with raw PCM16 (16kHz, mono, little-endian)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Import Deepgram client
+	deepgramClient := stt.NewDeepgramClient(h.cfg.DeepgramApiKey, 10*time.Second, h.logger)
+
+	// Get language from custom_parameters or use auto-detect
+	language := ""
+	if session.CustomParameters != nil {
+		if lang, ok := session.CustomParameters["language"].(string); ok && lang != "" {
+			language = lang
+		}
+	}
+
+	sttReq := &stt.STTRequest{
+		AudioData:   audioData, // Raw PCM16, 16kHz, mono, little-endian
+		SampleRate:  16000,     // 16kHz (required by Deepgram)
+		Language:    language,  // Auto-detect if empty
+		Model:       "nova-2",  // Best accuracy model
+		Punctuate:   true,      // Add punctuation
+		Interim:     false,     // Final results only
+		Endpointing: true,      // Enable endpointing
+	}
+
+	sttResp, err := deepgramClient.SpeechToText(ctx, sttReq)
+	if err != nil {
+		h.logger.Warn("Deepgram STT failed", zap.Error(err))
+		// Fallback to Whisper if Deepgram fails
+		if h.cfg.OpenAIApiKey != "" {
+			return h.callSTTServiceWhisper(session, audioData)
+		}
 		return ""
 	}
 
-	// Convert PCM to WAV format for STT service
-	// Note: OpenAI Whisper accepts raw PCM, but we'll format it as WAV
+	if sttResp == nil || sttResp.Text == "" {
+		h.logger.Warn("Deepgram STT returned empty text")
+		return ""
+	}
+
+	return sttResp.Text
+}
+
+// callSTTServiceWhisper fallback to OpenAI Whisper
+func (h *Handler) callSTTServiceWhisper(session *VoiceSession, audioData []byte) string {
+	// Convert PCM to WAV format for Whisper
 	session.Mu.RLock()
 	sampleRate := session.SampleRate
 	session.Mu.RUnlock()
@@ -1047,11 +1109,9 @@ func (h *Handler) callSTTService(session *VoiceSession, audioData []byte) string
 	}
 	wavData := h.convertPCMToWAV(audioData, sampleRate)
 
-	// Use OpenAI Whisper directly
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Call OpenAI Whisper API
 	sttService := ai.NewSTTService(h.cfg.OpenAIApiKey, "whisper-1", "", 10*time.Second, h.logger)
 	sttReq := &ai.STTRequest{
 		AudioData:   wavData,
@@ -1158,29 +1218,37 @@ func (h *Handler) sendTTSResponse(session *VoiceSession, text string) {
 		}
 	}
 
-	// Use OpenAI TTS service
+	// CRITICAL FIX: Use OpenAI TTS with PCM16 format (not MP3)
+	// OpenAI TTS supports "pcm" format which returns raw PCM16, 24kHz
+	// We need to resample to 16kHz for Exotel
 	openAITTS := ai.NewOpenAITTSService(h.cfg.OpenAIApiKey, 10*time.Second, h.logger)
 	ttsReq := &ai.OpenAITTSRequest{
 		Text:   text,
-		Model:  "tts-1-hd", // Best quality
+		Model:  "tts-1-hd", // Best quality model
 		Voice:  voice,
-		Format: "mp3",
+		Format: "pcm", // Request raw PCM16 format (24kHz output)
 		Speed:  1.0,
 	}
 
-	pcmData, err := openAITTS.TextToSpeechPCM(ctx, ttsReq)
+	// Get PCM16 audio (24kHz from OpenAI)
+	pcm24k, err := openAITTS.TextToSpeechPCM(ctx, ttsReq)
 	if err != nil {
 		h.logger.Warn("OpenAI TTS service failed", zap.Error(err))
 		h.sendTextResponse(session, text)
 		return
 	}
 
-	// Stream PCM in 640-byte chunks
-	h.streamPCMAudio(session, pcmData, "response_done")
+	// CRITICAL FIX: Resample 24kHz → 16kHz for Exotel
+	// OpenAI TTS returns 24kHz PCM, but Exotel expects 16kHz
+	pcm16k := h.resample24kTo16k(pcm24k)
+
+	// Stream PCM in 640-byte chunks (20ms frames at 16kHz)
+	h.streamPCMAudio(session, pcm16k, "response_done")
 }
 
-// streamPCMAudio streams raw 16-bit 16kHz PCM in 640-byte chunks to Exotel
-// Sends media events with base64-encoded payload as required by Exotel
+// streamPCMAudio streams raw 16-bit 16kHz PCM in 640-byte chunks (20ms frames) to Exotel
+// CRITICAL FIX: Exotel expects 20ms frames = 640 bytes at 16kHz (16-bit, mono)
+// Frame size = sampleRate * 2 bytes * 0.02 sec = 16000 * 2 * 0.02 = 640 bytes
 func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName string) {
 	session.Mu.RLock()
 	conn := session.Conn
@@ -1192,7 +1260,8 @@ func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName
 		return
 	}
 
-	// Chunk PCM data into 640-byte chunks (no gaps)
+	// CRITICAL FIX: Chunk into exactly 640-byte frames (20ms at 16kHz)
+	// Frame size = sampleRate * 2 bytes * 0.02 sec = 16000 * 2 * 0.02 = 640 bytes
 	chunkSize := 640
 	chunks := make([][]byte, 0)
 	for i := 0; i < len(pcmData); i += chunkSize {
@@ -1204,16 +1273,17 @@ func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName
 	}
 
 	// Send each chunk as Exotel media event with base64-encoded payload
-	for i, chunk := range chunks {
+	// Format: {"event": "media", "media": {"payload": "<base64>", "track": "outbound"}}
+	for _, chunk := range chunks {
 		// Base64 encode the PCM chunk
 		base64Payload := audio.EncodePCMChunkToBase64(chunk)
 
+		// CRITICAL FIX: Use correct Exotel Voicebot media event format
 		mediaEvent := map[string]interface{}{
-			"event":           "media",
-			"stream_sid":      streamSid,
-			"sequence_number": fmt.Sprintf("%d", i), // Start at 0, increment per chunk
+			"event": "media",
 			"media": map[string]interface{}{
 				"payload": base64Payload,
+				"track":   "outbound", // Required by Exotel
 			},
 		}
 
@@ -1231,7 +1301,7 @@ func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName
 		// No delay between chunks for low latency (<700ms requirement)
 	}
 
-	// Send mark event after all chunks
+	// Send mark event after all chunks (optional, for synchronization)
 	markEvent := map[string]interface{}{
 		"event":      "mark",
 		"stream_sid": streamSid,
@@ -1254,8 +1324,61 @@ func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName
 	h.logger.Info("Streamed PCM audio",
 		zap.String("call_sid", session.CallSid),
 		zap.Int("chunks", len(chunks)),
+		zap.Int("total_bytes", len(pcmData)),
 		zap.String("mark", markName),
 	)
+}
+
+// resample24kTo16k resamples 24kHz PCM16 to 16kHz using decimation
+func (h *Handler) resample24kTo16k(pcm24k []byte) []byte {
+	if len(pcm24k) == 0 {
+		return nil
+	}
+
+	// Convert bytes to int16 samples
+	samples24k := make([]int16, len(pcm24k)/2)
+	for i := 0; i < len(samples24k); i++ {
+		samples24k[i] = int16(pcm24k[i*2]) | int16(pcm24k[i*2+1])<<8
+	}
+
+	// Resample: 24kHz → 16kHz = 2:3 ratio
+	// Take every 3rd sample from 24k, but average for better quality
+	// Simple approach: take every 3rd sample (24k/3 = 8k, but we need 16k)
+	// Better: linear interpolation
+	// For 24k → 16k: output sample i = input sample at position i * 24/16 = i * 1.5
+	samples16k := make([]int16, len(samples24k)*16/24) // 16/24 = 2/3
+
+	for i := 0; i < len(samples16k); i++ {
+		// Calculate source position (float)
+		srcPos := float64(i) * 24.0 / 16.0 // = i * 1.5
+
+		// Get integer and fractional parts
+		srcIdx := int(srcPos)
+		frac := srcPos - float64(srcIdx)
+
+		if srcIdx < len(samples24k)-1 {
+			// Linear interpolation
+			sample0 := float64(samples24k[srcIdx])
+			sample1 := float64(samples24k[srcIdx+1])
+			interpolated := sample0 + (sample1-sample0)*frac
+			samples16k[i] = int16(interpolated)
+		} else if srcIdx < len(samples24k) {
+			// Last sample
+			samples16k[i] = samples24k[srcIdx]
+		} else {
+			// Beyond end, repeat last sample
+			samples16k[i] = samples24k[len(samples24k)-1]
+		}
+	}
+
+	// Convert back to bytes (little-endian)
+	result := make([]byte, len(samples16k)*2)
+	for i, sample := range samples16k {
+		result[i*2] = byte(sample & 0xFF)
+		result[i*2+1] = byte((sample >> 8) & 0xFF)
+	}
+
+	return result
 }
 
 // sendTextResponse sends a text response to Exotel (fallback when TTS fails)

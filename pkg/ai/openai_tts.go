@@ -72,7 +72,7 @@ func (s *OpenAITTSService) TextToSpeechPCM(ctx context.Context, req *OpenAITTSRe
 
 	format := req.Format
 	if format == "" {
-		format = "mp3" // Use mp3 and convert to PCM 16kHz
+		format = "pcm" // Use PCM format for direct audio streaming
 	}
 
 	speed := req.Speed
@@ -119,22 +119,27 @@ func (s *OpenAITTSService) TextToSpeechPCM(ctx context.Context, req *OpenAITTSRe
 		return nil, fmt.Errorf("OpenAI TTS API error: %d - %s", resp.StatusCode, string(body))
 	}
 
-	// Read audio data (mp3 format)
-	mp3Data, err := io.ReadAll(resp.Body)
+	// Read audio data
+	audioData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read audio data: %w", err)
 	}
 
-	// Convert MP3 to raw 16-bit 16kHz PCM using ffmpeg
-	if len(mp3Data) > 0 {
-		pcmData, err := s.convertMP3ToPCM16k(mp3Data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to convert MP3 to PCM: %w", err)
-		}
-		return pcmData, nil
+	if len(audioData) == 0 {
+		return nil, fmt.Errorf("no audio data received")
 	}
 
-	return nil, fmt.Errorf("no audio data received")
+	// If format is PCM, return directly (OpenAI returns 24kHz PCM16)
+	if format == "pcm" {
+		return audioData, nil
+	}
+
+	// Otherwise, convert MP3/other formats to PCM16 using ffmpeg
+	pcmData, err := s.convertMP3ToPCM16k(audioData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert audio to PCM: %w", err)
+	}
+	return pcmData, nil
 }
 
 // convertMP3ToPCM16k converts MP3 to raw 16-bit 16kHz mono PCM

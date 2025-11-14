@@ -510,10 +510,14 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 		appletID = s.cfg.ExotelVoicebotAppletID
 	}
 
+	// CRITICAL FIX: Correct parameter mapping for outbound Voicebot calls
+	// From = target number (customer we're calling)
+	// CallerID = Virtual Exophone (what shows on caller ID)
+	// To = target number (same as From for outbound)
 	callReq := exotel.ConnectCallRequest{
-		From:        req.From,
-		To:          req.To,
-		CallerID:    req.CallerID,
+		From:        req.To,       // Target number (customer we're calling)
+		To:          req.To,       // Target number (same as From for outbound)
+		CallerID:    req.CallerID, // Virtual Exophone (caller ID)
 		CallType:    "trans",
 		CallbackURL: "",
 		AppletID:    appletID,               // Use flow_id or configured Applet ID for voicebot
@@ -645,10 +649,11 @@ func (s *UnifiedServer) CreateCall(c *gin.Context) {
 		appletID = s.cfg.ExotelVoicebotAppletID
 	}
 
+	// CRITICAL FIX: Correct parameter mapping for outbound Voicebot calls
 	callReq := exotel.ConnectCallRequest{
-		From:        internalReq.From,
-		To:          internalReq.To,
-		CallerID:    internalReq.CallerID,
+		From:        internalReq.To,       // Target number (customer we're calling)
+		To:          internalReq.To,       // Target number (same as From for outbound)
+		CallerID:    internalReq.CallerID, // Virtual Exophone (caller ID)
 		CallType:    "trans",
 		CallbackURL: "",
 		AppletID:    appletID,               // Use flow_id or configured Applet ID for voicebot
@@ -892,12 +897,15 @@ func (s *UnifiedServer) processCampaigns(ctx context.Context) {
 				})
 
 			// Initiate call directly (no HTTP call needed)
+			// CRITICAL FIX: Correct parameter mapping for outbound Voicebot calls
 			callReq := exotel.ConnectCallRequest{
-				From:        s.cfg.ExotelExophone,
-				To:          phone,
-				CallerID:    s.cfg.ExotelExophone,
+				From:        phone,                // Target number (customer we're calling)
+				To:          phone,                // Target number (same as From for outbound)
+				CallerID:    s.cfg.ExotelExophone, // Virtual Exophone (caller ID)
 				CallType:    "trans",
 				CallbackURL: "",
+				AppletID:    flowID,                 // Use campaign flow_id for voicebot
+				AccountSID:  s.cfg.ExotelAccountSID, // Required for building voicebot URL
 			}
 
 			resp, err := s.exotelClient.ConnectCall(callReq)

@@ -60,20 +60,39 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 		c.subdomain, c.accountSID)
 
 	data := url.Values{}
-	data.Set("From", req.From)
-	data.Set("To", req.To) // Target number - Exotel will dial this directly
-	data.Set("CallerId", req.CallerID)
-	data.Set("CallType", req.CallType)
-	if req.CallbackURL != "" {
-		data.Set("StatusCallback", req.CallbackURL)
+
+	// CRITICAL FIX: Correct parameter mapping for outbound Voicebot calls
+	// For outbound Voicebot calls:
+	// - From = customer's phone number (endUserNumber / target number)
+	// - CallerId = our Virtual Exophone (e.g., 07948516111)
+	// - To = target number (optional for Voicebot Applets, but we'll set it)
+	// - Url = Voicebot Applet URL that returns WebSocket URL
+	// - AppletID is used to route through the Voicebot Applet
+
+	if req.AppletID != "" {
+		// Voicebot Applet call: Use correct mapping
+		// From = target number (customer we're calling)
+		// CallerId = Virtual Exophone (what shows on caller ID)
+		// To = target number (same as From for outbound)
+		// Note: For Voicebot Applets, Exotel uses the AppletID to route to our init endpoint
+		// The Applet is configured in Exotel Dashboard with our voicebot/init endpoint URL
+		// So we don't need to set Url here - Exotel will use the Applet configuration
+
+		data.Set("From", req.From)         // Customer's phone number (target)
+		data.Set("To", req.To)             // Target number (same as From for outbound)
+		data.Set("CallerId", req.CallerID) // Virtual Exophone (caller ID)
+		data.Set("CallType", req.CallType)
+		// Note: Url is not set here - Exotel uses Applet configuration
+	} else {
+		// Regular call (non-Voicebot)
+		data.Set("From", req.From)
+		data.Set("To", req.To)
+		data.Set("CallerId", req.CallerID)
+		data.Set("CallType", req.CallType)
 	}
 
-	// For Voicebot Applets: Don't set Url parameter - let Exotel dial the target number directly
-	// When AppletID is provided, pass it as CustomField so Exotel can route through the Applet
-	// The Applet should be configured in Exotel Dashboard with your voicebot init endpoint
-	if req.AppletID != "" {
-		// Pass Applet ID as CustomField - Exotel may use this for routing
-		data.Set("CustomField", req.AppletID)
+	if req.CallbackURL != "" {
+		data.Set("StatusCallback", req.CallbackURL)
 	}
 
 	httpReq, err := http.NewRequest("POST", endpoint, bytes.NewBufferString(data.Encode()))
