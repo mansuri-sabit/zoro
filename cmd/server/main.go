@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -1046,12 +1047,87 @@ func (s *UnifiedServer) processWebhookPayload(ctx context.Context, payload *Exot
 		fmt.Sscanf(payload.Duration, "%d", &durationSec)
 	}
 
+	// Check if call exists first to preserve correct number mapping
+	existingCall, _ := s.mongoClient.NewQuery("calls").
+		Select("call_sid", "from_number", "to_number", "direction", "virtual_number").
+		Eq("call_sid", payload.CallSid).
+		FindOne(ctx)
+
+	// CRITICAL FIX: Preserve correct number mapping from original call record
+	// Don't overwrite with potentially incorrect Exotel webhook values
+	var fromNumber, toNumber string
+	var direction string
+
+	if existingCall != nil {
+		// Use existing correct values if available
+		existingFrom := getStringFromMap(existingCall, "from_number", "")
+		existingTo := getStringFromMap(existingCall, "to_number", "")
+		existingDirection := getStringFromMap(existingCall, "direction", "")
+
+		// Validate: Don't overwrite if existing values are correct
+		// Check if Exotel's values indicate a self-call (same From and To)
+		normalizedExotelFrom := normalizePhoneForComparison(payload.From)
+		normalizedExotelTo := normalizePhoneForComparison(payload.To)
+		normalizedExistingFrom := normalizePhoneForComparison(existingFrom)
+		normalizedExistingTo := normalizePhoneForComparison(existingTo)
+
+		if normalizedExotelFrom == normalizedExotelTo {
+			// Exotel sent self-call - use existing correct values
+			fromNumber = existingFrom
+			toNumber = existingTo
+			direction = existingDirection
+			logger.Log.Warn("Webhook detected self-call - preserving original correct mapping",
+				zap.String("call_sid", payload.CallSid),
+				zap.String("exotel_from", payload.From),
+				zap.String("exotel_to", payload.To),
+				zap.String("preserved_from", fromNumber),
+				zap.String("preserved_to", toNumber),
+			)
+		} else if existingFrom != "" && existingTo != "" {
+			// Use existing values if they're different (likely correct)
+			if normalizedExistingFrom != normalizedExistingTo {
+				fromNumber = existingFrom
+				toNumber = existingTo
+				direction = existingDirection
+				logger.Log.Info("Webhook preserving original call mapping",
+					zap.String("call_sid", payload.CallSid),
+					zap.String("from", fromNumber),
+					zap.String("to", toNumber),
+				)
+			} else {
+				// Existing also has self-call issue - try Exotel's values
+				fromNumber = payload.From
+				toNumber = payload.To
+				direction = payload.Direction
+			}
+		} else {
+			// No existing values - use Exotel's
+			fromNumber = payload.From
+			toNumber = payload.To
+			direction = payload.Direction
+		}
+	} else {
+		// New call - use Exotel's values but validate
+		fromNumber = payload.From
+		toNumber = payload.To
+		direction = payload.Direction
+
+		// Validate: Check for self-call
+		if normalizePhoneForComparison(fromNumber) == normalizePhoneForComparison(toNumber) {
+			logger.Log.Warn("Webhook received self-call for new call record",
+				zap.String("call_sid", payload.CallSid),
+				zap.String("from", fromNumber),
+				zap.String("to", toNumber),
+			)
+		}
+	}
+
 	// Upsert call record (idempotent by CallSid)
 	callData := map[string]interface{}{
 		"call_sid":            payload.CallSid,
-		"from_number":         payload.From,
-		"to_number":           payload.To,
-		"direction":           payload.Direction,
+		"from_number":         fromNumber, // Use corrected/preserved value
+		"to_number":           toNumber,   // Use corrected/preserved value
+		"direction":           direction,  // Use preserved value
 		"status":              payload.Status,
 		"started_at":          startedAt,
 		"ended_at":            endedAt,
@@ -1059,12 +1135,6 @@ func (s *UnifiedServer) processWebhookPayload(ctx context.Context, payload *Exot
 		"recording_url":       payload.RecordingUrl,
 		"webhook_received_at": time.Now().Format(time.RFC3339),
 	}
-
-	// Check if call exists
-	existingCall, _ := s.mongoClient.NewQuery("calls").
-		Select("call_sid").
-		Eq("call_sid", payload.CallSid).
-		FindOne(ctx)
 
 	if existingCall != nil {
 		// Update existing
@@ -1131,4 +1201,37 @@ func (s *UnifiedServer) processWebhookPayload(ctx context.Context, payload *Exot
 	}
 
 	return nil
+}
+
+// getStringFromMap safely extracts string from map with default value
+func getStringFromMap(m map[string]interface{}, key, defaultValue string) string {
+	if val, ok := m[key]; ok {
+		if str, ok := val.(string); ok && str != "" {
+			return str
+		}
+	}
+	return defaultValue
+}
+
+// normalizePhoneForComparison normalizes phone number for comparison (handles errors gracefully)
+func normalizePhoneForComparison(phone string) string {
+	if phone == "" {
+		return ""
+	}
+	// Simple normalization: remove spaces, dashes, parentheses
+	normalized := strings.ReplaceAll(phone, " ", "")
+	normalized = strings.ReplaceAll(normalized, "-", "")
+	normalized = strings.ReplaceAll(normalized, "(", "")
+	normalized = strings.ReplaceAll(normalized, ")", "")
+	// Try to normalize to E.164 if possible
+	if !strings.HasPrefix(normalized, "+") {
+		if strings.HasPrefix(normalized, "91") && len(normalized) >= 12 {
+			normalized = "+" + normalized
+		} else if strings.HasPrefix(normalized, "0") && len(normalized) == 11 {
+			normalized = "+91" + normalized[1:]
+		} else if len(normalized) == 10 {
+			normalized = "+91" + normalized
+		}
+	}
+	return normalized
 }

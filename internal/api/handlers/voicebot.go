@@ -22,6 +22,7 @@ import (
 	"github.com/troikatech/calling-agent/pkg/env"
 	"github.com/troikatech/calling-agent/pkg/errors"
 	"github.com/troikatech/calling-agent/pkg/logger"
+	"github.com/troikatech/calling-agent/pkg/validation"
 )
 
 // VoiceSession manages state for an active Exotel voice call session
@@ -192,9 +193,12 @@ func removeSession(callSid string) {
 
 // ExotelVoicebotRequest represents the payload Exotel sends when a call starts
 type ExotelVoicebotRequest struct {
-	CallSid string `json:"CallSid" form:"CallSid"`
-	From    string `json:"From" form:"From"`
-	To      string `json:"To" form:"To"`
+	CallSid        string `json:"CallSid" form:"CallSid"`
+	From           string `json:"From" form:"From"`
+	To             string `json:"To" form:"To"`
+	DialWhomNumber string `json:"DialWhomNumber" form:"DialWhomNumber"` // Target number for outbound calls
+	VirtualNumber  string `json:"VirtualNumber" form:"VirtualNumber"`   // DID that received the call
+	Direction      string `json:"Direction" form:"Direction"`           // incoming/outbound
 	// Add other Exotel parameters as needed
 }
 
@@ -209,12 +213,23 @@ type VoicebotWebSocketResponse struct {
 func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	var req ExotelVoicebotRequest
 
+	// Log all incoming parameters for debugging
+	h.logger.Info("ExotelVoicebotEndpoint called - raw parameters",
+		zap.String("method", c.Request.Method),
+		zap.String("url", c.Request.URL.String()),
+		zap.Any("query_params", c.Request.URL.Query()),
+		zap.Any("form_params", c.Request.PostForm),
+	)
+
 	// Try to bind from query params (GET) or form/json (POST)
 	if err := c.ShouldBind(&req); err != nil {
 		// If binding fails, try to get from query params directly
 		req.CallSid = c.Query("CallSid")
 		req.From = c.Query("From")
 		req.To = c.Query("To")
+		req.DialWhomNumber = c.Query("DialWhomNumber")
+		req.VirtualNumber = c.Query("VirtualNumber")
+		req.Direction = c.Query("Direction")
 	}
 
 	// Also try alternative parameter names
@@ -227,6 +242,15 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	if req.To == "" {
 		req.To = c.Query("CallTo")
 	}
+	if req.DialWhomNumber == "" {
+		req.DialWhomNumber = c.Query("DialWhomNumber")
+	}
+	if req.VirtualNumber == "" {
+		req.VirtualNumber = c.Query("VirtualNumber")
+	}
+	if req.Direction == "" {
+		req.Direction = c.Query("Direction")
+	}
 
 	if req.CallSid == "" {
 		h.logger.Warn("ExotelVoicebotEndpoint called without CallSid",
@@ -238,12 +262,241 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		return
 	}
 
-	h.logger.Info("ExotelVoicebotEndpoint called",
+	// CRITICAL FIX: Look up original call record to get correct From/To mapping
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	originalCall, _ := h.mongoClient.NewQuery("calls").
+		Select("from_number", "to_number", "direction", "caller_id").
+		Eq("call_sid", req.CallSid).
+		FindOne(ctx)
+
+	var virtualNumber, targetNumber, callerNumber string
+	var isOutbound bool
+
+	if originalCall != nil {
+		// We have the original call record - use correct mapping
+		originalFrom := getString(originalCall, "from_number")
+		originalTo := getString(originalCall, "to_number")
+		originalDirection := getString(originalCall, "direction")
+		originalCallerID := getString(originalCall, "caller_id")
+
+		isOutbound = originalDirection == "outbound"
+
+		if isOutbound {
+			// Outbound call: From = Virtual Number (Exophone), To = Target Number
+			virtualNumber = originalFrom
+			targetNumber = originalTo
+			callerNumber = originalCallerID
+			if callerNumber == "" {
+				callerNumber = virtualNumber
+			}
+
+			h.logger.Info("Outbound call detected - using original call record",
+				zap.String("call_sid", req.CallSid),
+				zap.String("virtual_number", virtualNumber),
+				zap.String("target_number", targetNumber),
+				zap.String("original_from", originalFrom),
+				zap.String("original_to", originalTo),
+			)
+		} else {
+			// Inbound call: From = Caller, To = Virtual Number (DID)
+			virtualNumber = originalTo
+			targetNumber = originalFrom // Caller is the "target" for inbound
+			callerNumber = originalFrom
+
+			h.logger.Info("Inbound call detected - using original call record",
+				zap.String("call_sid", req.CallSid),
+				zap.String("virtual_number", virtualNumber),
+				zap.String("caller_number", targetNumber),
+				zap.String("original_from", originalFrom),
+				zap.String("original_to", originalTo),
+			)
+		}
+	} else {
+		// No original call record - try to detect from Exotel parameters
+		h.logger.Warn("No original call record found - attempting to detect from Exotel parameters",
+			zap.String("call_sid", req.CallSid),
+			zap.String("exotel_from", req.From),
+			zap.String("exotel_to", req.To),
+			zap.String("dial_whom_number", req.DialWhomNumber),
+			zap.String("virtual_number", req.VirtualNumber),
+			zap.String("direction", req.Direction),
+		)
+
+		// Try to detect virtual number
+		// Check if From or To matches configured Exophone
+		normalizedExophone := normalizePhoneNumber(h.cfg.ExotelExophone)
+		normalizedFrom := normalizePhoneNumber(req.From)
+		normalizedTo := normalizePhoneNumber(req.To)
+
+		if normalizedFrom == normalizedExophone {
+			// From is the virtual number - this is likely outbound
+			virtualNumber = req.From
+			targetNumber = req.DialWhomNumber
+			if targetNumber == "" {
+				targetNumber = req.To
+			}
+			isOutbound = true
+		} else if normalizedTo == normalizedExophone {
+			// To is the virtual number - this is likely inbound
+			virtualNumber = req.To
+			targetNumber = req.From
+			isOutbound = false
+		} else if req.VirtualNumber != "" {
+			// Use VirtualNumber parameter if provided
+			virtualNumber = req.VirtualNumber
+			if req.Direction == "incoming" {
+				targetNumber = req.From
+				isOutbound = false
+			} else {
+				targetNumber = req.DialWhomNumber
+				if targetNumber == "" {
+					targetNumber = req.To
+				}
+				isOutbound = true
+			}
+		} else {
+			// Fallback: use Exotel's From/To as-is but log warning
+			h.logger.Warn("Could not detect virtual number - using Exotel parameters as fallback",
+				zap.String("call_sid", req.CallSid),
+				zap.String("from", req.From),
+				zap.String("to", req.To),
+			)
+			virtualNumber = req.From
+			targetNumber = req.To
+			isOutbound = req.Direction != "incoming"
+		}
+
+		callerNumber = virtualNumber
+	}
+
+	// Validation: Ensure we have valid numbers
+	if virtualNumber == "" || targetNumber == "" {
+		h.logger.Error("Invalid number mapping detected",
+			zap.String("call_sid", req.CallSid),
+			zap.String("virtual_number", virtualNumber),
+			zap.String("target_number", targetNumber),
+			zap.String("exotel_from", req.From),
+			zap.String("exotel_to", req.To),
+		)
+		// Fallback to Exotel parameters if validation fails
+		if virtualNumber == "" {
+			virtualNumber = req.From
+		}
+		if targetNumber == "" {
+			targetNumber = req.To
+		}
+	}
+
+	// Prevent self-call (virtual number calling itself)
+	if normalizePhoneNumber(virtualNumber) == normalizePhoneNumber(targetNumber) {
+		h.logger.Error("Self-call detected - virtual number and target number are same",
+			zap.String("call_sid", req.CallSid),
+			zap.String("virtual_number", virtualNumber),
+			zap.String("target_number", targetNumber),
+			zap.String("exotel_from", req.From),
+			zap.String("exotel_to", req.To),
+		)
+		// Try to get correct target from DialWhomNumber
+		if req.DialWhomNumber != "" && normalizePhoneNumber(req.DialWhomNumber) != normalizePhoneNumber(virtualNumber) {
+			targetNumber = req.DialWhomNumber
+			h.logger.Info("Fixed self-call using DialWhomNumber",
+				zap.String("call_sid", req.CallSid),
+				zap.String("corrected_target", targetNumber),
+			)
+		} else if originalCall != nil {
+			// Use original target from database
+			originalTo := getString(originalCall, "to_number")
+			if originalTo != "" && normalizePhoneNumber(originalTo) != normalizePhoneNumber(virtualNumber) {
+				targetNumber = originalTo
+				h.logger.Info("Fixed self-call using original call record",
+					zap.String("call_sid", req.CallSid),
+					zap.String("corrected_target", targetNumber),
+				)
+			}
+		}
+	}
+
+	// Final validation
+	if normalizePhoneNumber(virtualNumber) == normalizePhoneNumber(targetNumber) {
+		h.logger.Error("CRITICAL: Still detecting self-call after fix attempts",
+			zap.String("call_sid", req.CallSid),
+			zap.String("virtual_number", virtualNumber),
+			zap.String("target_number", targetNumber),
+		)
+	}
+
+	// Log final mapping decision
+	h.logger.Info("ExotelVoicebotEndpoint - final number mapping",
 		zap.String("call_sid", req.CallSid),
-		zap.String("from", req.From),
-		zap.String("to", req.To),
-		zap.String("method", c.Request.Method),
+		zap.String("virtual_number", virtualNumber),
+		zap.String("target_number", targetNumber),
+		zap.String("caller_number", callerNumber),
+		zap.Bool("is_outbound", isOutbound),
+		zap.String("exotel_from", req.From),
+		zap.String("exotel_to", req.To),
+		zap.String("dial_whom_number", req.DialWhomNumber),
+		zap.String("virtual_number_param", req.VirtualNumber),
+		zap.String("direction", req.Direction),
 	)
+
+	// CRITICAL FIX: Update call record with corrected number mapping
+	// This ensures database has correct values even if Exotel sends incorrect ones
+	ctxUpdate, cancelUpdate := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancelUpdate()
+
+	updateData := map[string]interface{}{
+		"virtual_number": virtualNumber,
+		"target_number":  targetNumber,
+	}
+	// Only update from_number/to_number if they're different from existing (to preserve original)
+	if originalCall == nil || getString(originalCall, "from_number") == "" {
+		// New call or missing data - set corrected values
+		if isOutbound {
+			updateData["from_number"] = virtualNumber
+			updateData["to_number"] = targetNumber
+			updateData["direction"] = "outbound"
+		} else {
+			updateData["from_number"] = targetNumber // Caller
+			updateData["to_number"] = virtualNumber  // DID
+			updateData["direction"] = "inbound"
+		}
+	} else {
+		// Existing call - only update if current values show self-call
+		existingFrom := getString(originalCall, "from_number")
+		existingTo := getString(originalCall, "to_number")
+		if normalizePhoneNumber(existingFrom) == normalizePhoneNumber(existingTo) {
+			// Self-call detected in existing record - fix it
+			if isOutbound {
+				updateData["from_number"] = virtualNumber
+				updateData["to_number"] = targetNumber
+			} else {
+				updateData["from_number"] = targetNumber
+				updateData["to_number"] = virtualNumber
+			}
+			newFrom := ""
+			newTo := ""
+			if val, ok := updateData["from_number"].(string); ok {
+				newFrom = val
+			}
+			if val, ok := updateData["to_number"].(string); ok {
+				newTo = val
+			}
+			h.logger.Info("Updating call record with corrected number mapping",
+				zap.String("call_sid", req.CallSid),
+				zap.String("old_from", existingFrom),
+				zap.String("old_to", existingTo),
+				zap.String("new_from", newFrom),
+				zap.String("new_to", newTo),
+			)
+		}
+	}
+
+	// Update call record
+	h.mongoClient.NewQuery("calls").
+		Eq("call_sid", req.CallSid).
+		UpdateOne(ctxUpdate, updateData)
 
 	// Get base URL - prefer configured URL, fallback to request-based detection
 	baseURL := h.cfg.VoicebotBaseURL
@@ -288,17 +541,22 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	}
 
 	// WebSocket endpoint with call parameters - use /was as per requirements
+	// Use CORRECTED virtual number and target number (not Exotel's potentially incorrect values)
 	// URL encode all parameters to handle special characters properly
 	wsURL := fmt.Sprintf("%s/was?sample-rate=16000&call_sid=%s&from=%s&to=%s",
 		wsBaseURL,
 		url.QueryEscape(req.CallSid),
-		url.QueryEscape(req.From),
-		url.QueryEscape(req.To),
+		url.QueryEscape(virtualNumber), // Use corrected virtual number
+		url.QueryEscape(targetNumber),  // Use corrected target number
 	)
 
 	h.logger.Info("Generated WebSocket URL for Exotel",
 		zap.String("call_sid", req.CallSid),
+		zap.String("virtual_number", virtualNumber),
+		zap.String("target_number", targetNumber),
 		zap.String("ws_url", wsURL),
+		zap.String("exotel_from", req.From),
+		zap.String("exotel_to", req.To),
 	)
 
 	response := VoicebotWebSocketResponse{
@@ -1318,6 +1576,23 @@ func getStringFromMap(m map[string]interface{}, key, defaultValue string) string
 		}
 	}
 	return defaultValue
+}
+
+// normalizePhoneNumber normalizes phone number for comparison (handles errors gracefully)
+func normalizePhoneNumber(phone string) string {
+	if phone == "" {
+		return ""
+	}
+	normalized, err := validation.NormalizeE164(phone)
+	if err != nil {
+		// If normalization fails, return cleaned version for comparison
+		cleaned := strings.ReplaceAll(phone, " ", "")
+		cleaned = strings.ReplaceAll(cleaned, "-", "")
+		cleaned = strings.ReplaceAll(cleaned, "(", "")
+		cleaned = strings.ReplaceAll(cleaned, ")", "")
+		return cleaned
+	}
+	return normalized
 }
 
 // finalizeCallRecord updates call record when session ends
