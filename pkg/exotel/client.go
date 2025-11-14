@@ -70,16 +70,23 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 	// - AppletID is used to route through the Voicebot Applet
 
 	if req.AppletID != "" {
-		// Voicebot Applet call: Use correct mapping
-		// From = target number (customer we're calling)
-		// CallerId = Virtual Exophone (what shows on caller ID)
-		// To = target number (same as From for outbound)
+		// Voicebot Applet call: Use correct mapping for Exotel API
+		// CRITICAL: For Exotel ConnectCall API with Voicebot Applets:
+		// - From = Virtual Exophone (the number that will make the call)
+		// - To = Target number (customer we're calling)
+		// - CallerId = Virtual Exophone (what shows on caller ID - same as From)
 		// Note: For Voicebot Applets, Exotel uses the AppletID to route to our init endpoint
 		// The Applet is configured in Exotel Dashboard with our voicebot/init endpoint URL
-		// So we don't need to set Url here - Exotel will use the Applet configuration
 
-		data.Set("From", req.From)         // Customer's phone number (target)
-		data.Set("To", req.To)             // Target number (same as From for outbound)
+		// Use CallerID as From (Virtual Exophone makes the call)
+		fromNumber := req.CallerID
+		if fromNumber == "" {
+			// Fallback: if CallerID not provided, use From (should be Exophone)
+			fromNumber = req.From
+		}
+
+		data.Set("From", fromNumber)       // Virtual Exophone (makes the call)
+		data.Set("To", req.To)             // Target number (customer we're calling)
 		data.Set("CallerId", req.CallerID) // Virtual Exophone (caller ID)
 		data.Set("CallType", req.CallType)
 		// Note: Url is not set here - Exotel uses Applet configuration

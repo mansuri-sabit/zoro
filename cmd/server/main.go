@@ -511,12 +511,13 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 	}
 
 	// CRITICAL FIX: Correct parameter mapping for outbound Voicebot calls
-	// From = target number (customer we're calling)
-	// CallerID = Virtual Exophone (what shows on caller ID)
-	// To = target number (same as From for outbound)
+	// For Exotel ConnectCall API with Voicebot Applets:
+	// - From = Virtual Exophone (the number that will make the call)
+	// - To = Target number (customer we're calling)
+	// - CallerID = Virtual Exophone (what shows on caller ID)
 	callReq := exotel.ConnectCallRequest{
-		From:        req.To,       // Target number (customer we're calling)
-		To:          req.To,       // Target number (same as From for outbound)
+		From:        req.CallerID, // Virtual Exophone (makes the call)
+		To:          req.To,       // Target number (customer we're calling)
 		CallerID:    req.CallerID, // Virtual Exophone (caller ID)
 		CallType:    "trans",
 		CallbackURL: "",
@@ -550,13 +551,17 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 		zap.String("applet_id", appletID),
 	)
 
+	// Store correct mapping in database:
+	// from_number = Virtual Exophone (what made the call)
+	// to_number = Target number (customer)
+	// caller_id = Virtual Exophone (caller ID)
 	callData := map[string]interface{}{
 		"call_sid":    resp.Call.Sid,
 		"direction":   "outbound",
-		"from_number": req.From,
-		"to_number":   req.To,
+		"from_number": req.CallerID, // Virtual Exophone (what made the call)
+		"to_number":   req.To,       // Target number (customer)
 		"flow_id":     req.FlowID,
-		"caller_id":   req.CallerID,
+		"caller_id":   req.CallerID, // Virtual Exophone (caller ID)
 		"status":      resp.Call.Status,
 		"started_at":  time.Now().Format(time.RFC3339),
 		"created_at":  time.Now().Format(time.RFC3339),
@@ -650,9 +655,13 @@ func (s *UnifiedServer) CreateCall(c *gin.Context) {
 	}
 
 	// CRITICAL FIX: Correct parameter mapping for outbound Voicebot calls
+	// For Exotel ConnectCall API with Voicebot Applets:
+	// - From = Virtual Exophone (the number that will make the call)
+	// - To = Target number (customer we're calling)
+	// - CallerID = Virtual Exophone (what shows on caller ID)
 	callReq := exotel.ConnectCallRequest{
-		From:        internalReq.To,       // Target number (customer we're calling)
-		To:          internalReq.To,       // Target number (same as From for outbound)
+		From:        internalReq.CallerID, // Virtual Exophone (makes the call)
+		To:          internalReq.To,       // Target number (customer we're calling)
 		CallerID:    internalReq.CallerID, // Virtual Exophone (caller ID)
 		CallType:    "trans",
 		CallbackURL: "",
@@ -675,13 +684,17 @@ func (s *UnifiedServer) CreateCall(c *gin.Context) {
 		return
 	}
 
+	// Store correct mapping in database:
+	// from_number = Virtual Exophone (what made the call)
+	// to_number = Target number (customer)
+	// caller_id = Virtual Exophone (caller ID)
 	callData := map[string]interface{}{
 		"call_sid":    resp.Call.Sid,
 		"direction":   "outbound",
-		"from_number": internalReq.From,
-		"to_number":   internalReq.To,
+		"from_number": internalReq.CallerID, // Virtual Exophone (what made the call)
+		"to_number":   internalReq.To,       // Target number (customer)
 		"flow_id":     internalReq.FlowID,
-		"caller_id":   internalReq.CallerID,
+		"caller_id":   internalReq.CallerID, // Virtual Exophone (caller ID)
 		"status":      resp.Call.Status,
 		"started_at":  time.Now().Format(time.RFC3339),
 		"created_at":  time.Now().Format(time.RFC3339),
@@ -921,14 +934,17 @@ func (s *UnifiedServer) processCampaigns(ctx context.Context) {
 				continue
 			}
 
-			// Save call record
+			// Save call record with correct mapping:
+			// from_number = Virtual Exophone (what made the call)
+			// to_number = Target number (customer)
+			// caller_id = Virtual Exophone (caller ID)
 			callData := map[string]interface{}{
 				"call_sid":    resp.Call.Sid,
 				"direction":   "outbound",
-				"from_number": s.cfg.ExotelExophone,
-				"to_number":   phone,
+				"from_number": s.cfg.ExotelExophone, // Virtual Exophone (what made the call)
+				"to_number":   phone,                // Target number (customer)
 				"flow_id":     flowID,
-				"caller_id":   s.cfg.ExotelExophone,
+				"caller_id":   s.cfg.ExotelExophone, // Virtual Exophone (caller ID)
 				"status":      resp.Call.Status,
 				"started_at":  time.Now().Format(time.RFC3339),
 				"created_at":  time.Now().Format(time.RFC3339),

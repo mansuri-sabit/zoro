@@ -286,8 +286,9 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 
 		if isOutbound {
 			// Outbound call: From = Virtual Number (Exophone), To = Target Number
-			virtualNumber = originalFrom
-			targetNumber = originalTo
+			// Database stores: from_number = Virtual Exophone, to_number = Target
+			virtualNumber = originalFrom // Virtual Exophone (what made the call)
+			targetNumber = originalTo    // Target number (customer)
 			callerNumber = originalCallerID
 			if callerNumber == "" {
 				callerNumber = virtualNumber
