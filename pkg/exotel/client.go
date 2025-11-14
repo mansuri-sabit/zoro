@@ -45,6 +45,9 @@ type ConnectCallRequest struct {
 	CallbackURL string
 	AppletID    string // Applet ID for voicebot calls - will be converted to Url parameter
 	AccountSID  string // Account SID for building voicebot URL
+	// Additional parameters for Voicebot Applets
+	CustomField string // Custom field to pass target number (alternative to To)
+	UserData    string // User data JSON string (alternative to To)
 }
 
 type ConnectCallResponse struct {
@@ -73,10 +76,12 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 		// Voicebot Applet call: Use correct mapping for Exotel API
 		// CRITICAL: For Exotel ConnectCall API with Voicebot Applets:
 		// - From = Virtual Exophone (the number that will make the call)
-		// - To = Target number (customer we're calling)
+		// - To = Target number (customer we're calling) - MUST be set correctly
 		// - CallerId = Virtual Exophone (what shows on caller ID - same as From)
-		// Note: For Voicebot Applets, Exotel uses the AppletID to route to our init endpoint
-		// The Applet is configured in Exotel Dashboard with our voicebot/init endpoint URL
+		//
+		// IMPORTANT: Exotel Voicebot Applets IGNORE the To parameter when AppletID is used
+		// The Applet uses its internal flow configuration instead
+		// Solution: Configure Applet in Exotel Dashboard OR use direct URL (without AppletID)
 
 		// Use CallerID as From (Virtual Exophone makes the call)
 		fromNumber := req.CallerID
@@ -85,17 +90,40 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 			fromNumber = req.From
 		}
 
+		// CRITICAL: Normalize target number to ensure consistent format
+		targetNumber := req.To
+
+		// CRITICAL: Set To parameter - even though Exotel might ignore it for Applets
+		// We still send it in case Exotel fixes this behavior or Applet is configured to use it
 		data.Set("From", fromNumber)       // Virtual Exophone (makes the call)
-		data.Set("To", req.To)             // Target number (customer we're calling)
+		data.Set("To", targetNumber)       // Target number (customer we're calling) - CRITICAL
 		data.Set("CallerId", req.CallerID) // Virtual Exophone (caller ID)
 		data.Set("CallType", req.CallType)
 
 		// CRITICAL: For Voicebot Applets, also pass target number in UserData
 		// This ensures Exotel preserves it even if To parameter is ignored
-		if req.To != "" {
-			data.Set("UserData", fmt.Sprintf(`{"target_number":"%s"}`, req.To))
+		// Some Applets can access UserData from their flow
+		if targetNumber != "" {
+			data.Set("UserData", fmt.Sprintf(`{"target_number":"%s","to_number":"%s","To":"%s"}`, targetNumber, targetNumber, targetNumber))
 		}
-		// Note: Url is not set here - Exotel uses Applet configuration
+
+		// CRITICAL: Also try passing as CustomField if Exotel supports it
+		// Some Exotel configurations use CustomField for target numbers
+		if targetNumber != "" {
+			data.Set("CustomField", targetNumber)
+		}
+
+		// CRITICAL: Log warning about Applet limitation
+		fmt.Printf("[WARNING] Using AppletID=%s - Exotel may ignore To parameter!\n", req.AppletID)
+		fmt.Printf("[WARNING] Target number %s may not be used by Exotel Applet\n", targetNumber)
+		fmt.Printf("[WARNING] Solution: Configure Applet in Exotel Dashboard to use To parameter\n")
+
+		// Note: When AppletID is set, Exotel uses Applet's internal configuration
+		// The Applet MUST be configured in Exotel Dashboard to:
+		// 1. Accept To parameter from API calls, OR
+		// 2. Use UserData.target_number, OR
+		// 3. Use CustomField
+		// Otherwise, Exotel will create self-calls (From=To=VirtualNumber)
 	} else {
 		// Regular call (non-Voicebot)
 		data.Set("From", req.From)

@@ -278,33 +278,33 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		Eq("call_sid", callSidNormalized).
 		FindOne(ctx)
 
-	// If not found, try with different case or try to find by phone numbers (for outbound calls)
+	// CRITICAL FIX: If not found by CallSid, ALWAYS try to find most recent outbound call
+	// This is essential because Exotel doesn't preserve To parameter for Voicebot Applets
 	if originalCall == nil {
-		// For outbound calls, try to find by matching From/To within last 2 minutes
-		// This handles timing issues where Exotel calls back before MongoDB indexes
 		normalizedExophone := normalizePhoneNumber(h.cfg.ExotelExophone)
 		normalizedFrom := normalizePhoneNumber(req.From)
 
 		// Check if this looks like an outbound call (From = Exophone)
 		if normalizedFrom == normalizedExophone || req.Direction != "incoming" {
 			// This looks like an outbound call - try to find recent call record
-			// Get calls from last 3 minutes to handle timing issues
-			threeMinutesAgo := time.Now().Add(-3 * time.Minute).Format(time.RFC3339)
+			// Get calls from last 5 minutes to handle timing issues
+			fiveMinutesAgo := time.Now().Add(-5 * time.Minute).Format(time.RFC3339)
 
 			recentCalls, _ := h.mongoClient.NewQuery("calls").
 				Select("from_number", "to_number", "direction", "caller_id", "call_sid", "created_at").
 				Eq("from_number", h.cfg.ExotelExophone).
 				Eq("direction", "outbound").
-				Gte("created_at", threeMinutesAgo).
+				Gte("created_at", fiveMinutesAgo).
 				Find(ctx)
 
 			h.logger.Info("Searching for recent outbound calls",
 				zap.String("requested_call_sid", callSidNormalized),
 				zap.Int("found_calls_count", len(recentCalls)),
 				zap.String("exophone", h.cfg.ExotelExophone),
+				zap.String("time_window", "5 minutes"),
 			)
 
-			// Find the most recent call that matches CallSid (partial match)
+			// First, try to find exact or partial CallSid match
 			for _, call := range recentCalls {
 				callSid := getString(call, "call_sid")
 				// Check if CallSid is similar (might have different format)
@@ -319,14 +319,31 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 				}
 			}
 
-			// If still not found, use the most recent outbound call as fallback
+			// CRITICAL: If still not found, ALWAYS use the most recent outbound call
+			// This ensures we have a target number even if CallSid doesn't match
 			if originalCall == nil && len(recentCalls) > 0 {
-				// Sort by created_at descending and take the first one
-				originalCall = recentCalls[0] // Most recent should be first
-				h.logger.Info("Using most recent outbound call as fallback",
+				// Use the most recent call (should be first in results if sorted by created_at desc)
+				// If not sorted, find the most recent by comparing timestamps
+				mostRecent := recentCalls[0]
+				mostRecentTime := getString(mostRecent, "created_at")
+				for _, call := range recentCalls[1:] {
+					callTime := getString(call, "created_at")
+					if callTime > mostRecentTime {
+						mostRecent = call
+						mostRecentTime = callTime
+					}
+				}
+				originalCall = mostRecent
+				h.logger.Info("Using most recent outbound call as fallback - CRITICAL FIX",
 					zap.String("requested_call_sid", callSidNormalized),
 					zap.String("fallback_call_sid", getString(originalCall, "call_sid")),
 					zap.String("fallback_to_number", getString(originalCall, "to_number")),
+					zap.String("fallback_created_at", getString(originalCall, "created_at")),
+				)
+			} else if len(recentCalls) == 0 {
+				h.logger.Warn("No recent outbound calls found - cannot recover target number",
+					zap.String("requested_call_sid", callSidNormalized),
+					zap.String("exophone", h.cfg.ExotelExophone),
 				)
 			}
 		}
