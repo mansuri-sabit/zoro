@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -15,9 +18,55 @@ import (
 	"github.com/troikatech/calling-agent/pkg/mongo"
 )
 
+// loadEnvFile manually loads .env file handling BOM
+func loadEnvFile(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Remove BOM if present
+		if len(line) > 0 {
+			r, size := utf8.DecodeRuneInString(line)
+			if r == '\ufeff' {
+				line = line[size:]
+			}
+		}
+
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			os.Setenv(key, value)
+		}
+	}
+	return scanner.Err()
+}
+
 func main() {
-	// Load environment variables
-	cfg, err := env.Load(".env")
+	// Load environment variables - try multiple files
+	envFiles := []string{".env", "../.env", "../../.env", "../.envc", "../../.envc", ".envc"}
+	for _, envFile := range envFiles {
+		if _, err := os.Stat(envFile); err == nil {
+			if err := loadEnvFile(envFile); err == nil {
+				log.Printf("Loaded environment from: %s", envFile)
+			}
+		}
+	}
+
+	if os.Getenv("JWT_SECRET") == "" {
+		os.Setenv("JWT_SECRET", "temp-secret-for-create-user-script")
+	}
+
+	cfg, err := env.Load("")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}

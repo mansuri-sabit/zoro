@@ -1,10 +1,14 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,7 +36,9 @@ type VoiceSession struct {
 	IsActive            bool
 	Mu                  sync.RWMutex
 	CancelCtx           context.CancelFunc
-	ProcessingMu        sync.Mutex // Prevents concurrent STT→AI→TTS processing
+	ProcessingMu        sync.Mutex             // Prevents concurrent STT→AI→TTS processing
+	SampleRate          int                    // Audio sample rate (default 16000)
+	CustomParameters    map[string]interface{} // Custom parameters from start event
 }
 
 // ExotelEvent represents the base structure for Exotel WebSocket events
@@ -43,8 +49,9 @@ type ExotelEvent struct {
 
 // StartEvent represents Exotel "start" event
 type StartEvent struct {
-	Event     string `json:"event"`
-	StreamSid string `json:"stream_sid"`
+	Event            string                 `json:"event"`
+	StreamSid        string                 `json:"stream_sid"`
+	CustomParameters map[string]interface{} `json:"custom_parameters,omitempty"`
 }
 
 // MediaEvent represents Exotel "media" event with base64-encoded PCM audio
@@ -69,14 +76,19 @@ type AudioBuffer struct {
 	totalSize   int
 	maxSize     int // Maximum buffer size before processing (e.g., 1 second of audio)
 	lastProcess time.Time
+	sampleRate  int // Sample rate for this buffer (default 16000)
 }
 
 // NewAudioBuffer creates a new audio buffer
-func NewAudioBuffer(maxSize int) *AudioBuffer {
+func NewAudioBuffer(maxSize int, sampleRate int) *AudioBuffer {
+	if sampleRate == 0 {
+		sampleRate = 16000 // Default 16kHz
+	}
 	return &AudioBuffer{
 		chunks:      make([][]byte, 0),
 		maxSize:     maxSize,
 		lastProcess: time.Now(),
+		sampleRate:  sampleRate,
 	}
 }
 
@@ -122,7 +134,7 @@ var sessions = make(map[string]*VoiceSession)
 var sessionsMu sync.RWMutex
 
 // getOrCreateSession gets or creates a voice session for call_sid
-func getOrCreateSession(callSid, streamSid, from, to string, conn *websocket.Conn) *VoiceSession {
+func getOrCreateSession(callSid, streamSid, from, to string, conn *websocket.Conn, sampleRate int) *VoiceSession {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 
@@ -130,11 +142,15 @@ func getOrCreateSession(callSid, streamSid, from, to string, conn *websocket.Con
 		session.Mu.Lock()
 		session.StreamSid = streamSid
 		session.Conn = conn
+		session.SampleRate = sampleRate
 		session.Mu.Unlock()
 		return session
 	}
 
 	_, cancel := context.WithCancel(context.Background())
+	if sampleRate == 0 {
+		sampleRate = 16000 // Default 16kHz
+	}
 	session := &VoiceSession{
 		CallSid:             callSid,
 		StreamSid:           streamSid,
@@ -142,10 +158,12 @@ func getOrCreateSession(callSid, streamSid, from, to string, conn *websocket.Con
 		To:                  to,
 		Conn:                conn,
 		ConversationHistory: make([]map[string]interface{}, 0),
-		AudioBuffer:         NewAudioBuffer(8 * 1024), // 8KB buffer (~1 second at 8kHz)
+		AudioBuffer:         NewAudioBuffer(32*1024, sampleRate), // 32KB buffer (~1 second at 16kHz, 2 bytes per sample)
 		GreetingSent:        false,
 		IsActive:            true,
 		CancelCtx:           cancel,
+		SampleRate:          sampleRate,
+		CustomParameters:    make(map[string]interface{}),
 	}
 
 	sessions[callSid] = session
@@ -308,38 +326,8 @@ func createWebSocketUpgrader(cfg *env.Config) websocket.Upgrader {
 // VoicebotWebSocket handles WebSocket connection from Exotel Voicebot
 // This is the actual WebSocket endpoint that Exotel connects to for real-time audio streaming
 // Must be accessible via public wss:// URL for Exotel to connect
-// Supports Bearer token authentication if EXOTEL_VOICEBOT_TOKEN is configured
+// No authentication required (direct connect as per requirements)
 func (h *Handler) VoicebotWebSocket(c *gin.Context) {
-	// Authenticate WebSocket connection if token is configured
-	if h.cfg.ExotelVoicebotToken != "" {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			h.logger.Warn("WebSocket connection rejected - missing Authorization header",
-				zap.String("remote_addr", c.Request.RemoteAddr),
-			)
-			errors.Unauthorized(c, "Authorization required")
-			return
-		}
-
-		// Extract Bearer token
-		expectedToken := "Bearer " + h.cfg.ExotelVoicebotToken
-		if authHeader != expectedToken {
-			// Log partial token for debugging (first 20 chars)
-			logToken := authHeader
-			if len(logToken) > 20 {
-				logToken = logToken[:20] + "..."
-			}
-			h.logger.Warn("WebSocket connection rejected - invalid token",
-				zap.String("remote_addr", c.Request.RemoteAddr),
-				zap.String("provided", logToken),
-			)
-			errors.Unauthorized(c, "Invalid authorization token")
-			return
-		}
-
-		h.logger.Debug("WebSocket connection authenticated with Bearer token")
-	}
-
 	// Get call parameters from query string (Exotel sends call_sid or callLogId)
 	callSid := c.Query("call_sid")
 	if callSid == "" {
@@ -348,6 +336,15 @@ func (h *Handler) VoicebotWebSocket(c *gin.Context) {
 	}
 	from := c.Query("from")
 	to := c.Query("to")
+
+	// Get sample-rate from query parameter (default 16000)
+	sampleRateStr := c.Query("sample-rate")
+	sampleRate := 16000 // Default 16kHz
+	if sampleRateStr != "" {
+		if sr, err := strconv.Atoi(sampleRateStr); err == nil && sr > 0 {
+			sampleRate = sr
+		}
+	}
 
 	if callSid == "" {
 		errors.BadRequest(c, "call_sid or callLogId is required")
@@ -380,7 +377,7 @@ func (h *Handler) VoicebotWebSocket(c *gin.Context) {
 	h.initializeCallRecord(callSid, from, to)
 
 	// Handle WebSocket messages - Exotel sends JSON events, not binary
-	h.handleVoicebotConnection(conn, callSid, from, to)
+	h.handleVoicebotConnection(conn, callSid, from, to, sampleRate)
 }
 
 // initializeCallRecord creates or updates call record when Voicebot session starts
@@ -416,7 +413,7 @@ func (h *Handler) initializeCallRecord(callSid, from, to string) {
 }
 
 // handleVoicebotConnection manages the WebSocket connection lifecycle
-func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, to string) {
+func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, to string, sampleRate int) {
 	// Set read deadline to detect connection closure
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	conn.SetPongHandler(func(string) error {
@@ -445,7 +442,7 @@ func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, 
 
 			// Exotel sends JSON events as text messages
 			if messageType == websocket.TextMessage {
-				h.handleExotelEvent(conn, callSid, from, to, message)
+				h.handleExotelEvent(conn, callSid, from, to, message, sampleRate)
 			} else if messageType == websocket.PingMessage {
 				conn.WriteMessage(websocket.PongMessage, nil)
 			}
@@ -473,8 +470,8 @@ func (h *Handler) handleVoicebotConnection(conn *websocket.Conn, callSid, from, 
 	}
 }
 
-// handleExotelEvent processes Exotel JSON events (start, media, stop)
-func (h *Handler) handleExotelEvent(conn *websocket.Conn, callSid, from, to string, message []byte) {
+// handleExotelEvent processes Exotel JSON events (start, media, stop, clear)
+func (h *Handler) handleExotelEvent(conn *websocket.Conn, callSid, from, to string, message []byte, sampleRate int) {
 	var event ExotelEvent
 	if err := json.Unmarshal(message, &event); err != nil {
 		h.logger.Warn("Failed to parse Exotel event", zap.Error(err), zap.String("raw", string(message)))
@@ -489,19 +486,21 @@ func (h *Handler) handleExotelEvent(conn *websocket.Conn, callSid, from, to stri
 
 	switch event.Event {
 	case "start":
-		h.handleStartEvent(conn, callSid, from, to, message)
+		h.handleStartEvent(conn, callSid, from, to, message, sampleRate)
 	case "media":
 		h.handleMediaEvent(conn, callSid, message)
 	case "stop":
 		h.handleStopEvent(callSid, message)
+	case "clear":
+		h.handleClearEvent(callSid, message)
 	default:
 		h.logger.Debug("Unknown Exotel event", zap.String("event", event.Event))
 	}
 }
 
 // handleStartEvent processes Exotel "start" event
-// On start: create session, trigger greeting TTS
-func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to string, message []byte) {
+// On start: create session, extract custom_parameters, trigger greeting TTS
+func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to string, message []byte, sampleRate int) {
 	var startEvent StartEvent
 	if err := json.Unmarshal(message, &startEvent); err != nil {
 		h.logger.Warn("Failed to parse start event", zap.Error(err))
@@ -509,19 +508,29 @@ func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to strin
 	}
 
 	// Create or get session
-	session := getOrCreateSession(callSid, startEvent.StreamSid, from, to, conn)
+	session := getOrCreateSession(callSid, startEvent.StreamSid, from, to, conn, sampleRate)
 
+	// Store custom_parameters in session
 	session.Mu.Lock()
 	if session.GreetingSent {
 		session.Mu.Unlock()
 		return // Greeting already sent
 	}
+
+	// Extract and store custom_parameters
+	if startEvent.CustomParameters != nil {
+		session.CustomParameters = startEvent.CustomParameters
+		session.SampleRate = sampleRate
+	}
+
 	session.GreetingSent = true
 	session.Mu.Unlock()
 
 	h.logger.Info("Handling start event, sending greeting",
 		zap.String("call_sid", callSid),
 		zap.String("stream_sid", startEvent.StreamSid),
+		zap.Any("custom_parameters", startEvent.CustomParameters),
+		zap.Int("sample_rate", sampleRate),
 	)
 
 	// Send greeting TTS in a goroutine
@@ -531,7 +540,7 @@ func (h *Handler) handleStartEvent(conn *websocket.Conn, callSid, from, to strin
 // sendGreeting sends TTS greeting to Exotel in chunked PCM format
 func (h *Handler) sendGreeting(session *VoiceSession) {
 	greetingText := "Hello! How can I help you today?"
-	if !h.cfg.FeatureAI || h.ttsService == nil || !h.ttsService.IsAvailable() {
+	if !h.cfg.FeatureAI || h.cfg.OpenAIApiKey == "" {
 		// Fallback: send text response
 		h.sendTextResponse(session, greetingText)
 		return
@@ -540,24 +549,33 @@ func (h *Handler) sendGreeting(session *VoiceSession) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	ttsReq := &ai.TTSRequest{
-		Text:            greetingText,
-		VoiceID:         "",
-		ModelID:         "",
-		OutputFormat:    "",
-		Stability:       0.5,
-		SimilarityBoost: 0.5,
+	// Get voice from custom_parameters or use default
+	voice := "shimmer" // Default: female, super natural Hindi
+	if session.CustomParameters != nil {
+		if v, ok := session.CustomParameters["voice_id"].(string); ok && v != "" {
+			voice = v
+		}
 	}
 
-	mp3Data, err := h.ttsService.TextToSpeech(ctx, ttsReq)
+	// Use OpenAI TTS service
+	openAITTS := ai.NewOpenAITTSService(h.cfg.OpenAIApiKey, 10*time.Second, h.logger)
+	ttsReq := &ai.OpenAITTSRequest{
+		Text:   greetingText,
+		Model:  "tts-1-hd", // Best quality
+		Voice:  voice,
+		Format: "mp3",
+		Speed:  1.0,
+	}
+
+	pcmData, err := openAITTS.TextToSpeechPCM(ctx, ttsReq)
 	if err != nil {
-		h.logger.Warn("TTS greeting failed", zap.Error(err))
+		h.logger.Warn("OpenAI TTS greeting failed", zap.Error(err))
 		h.sendTextResponse(session, greetingText)
 		return
 	}
 
-	// Convert MP3 to PCM and stream in chunks
-	h.streamTTSAudio(session, mp3Data, "greeting_done")
+	// Stream PCM in 640-byte chunks
+	h.streamPCMAudio(session, pcmData, "greeting_done")
 }
 
 // handleMediaEvent processes Exotel "media" event with base64-encoded PCM audio
@@ -607,7 +625,7 @@ func (h *Handler) processAudioBuffer(session *VoiceSession) {
 	}
 
 	// Step 1: Convert audio to text using STT
-	transcribedText := h.callSTTService(audioData)
+	transcribedText := h.callSTTService(session, audioData)
 	if transcribedText == "" {
 		h.logger.Warn("STT returned empty text", zap.String("call_sid", session.CallSid))
 		return
@@ -631,7 +649,14 @@ func (h *Handler) processAudioBuffer(session *VoiceSession) {
 	// Step 3: Get call context and generate AI response
 	callContext := h.getCallContext(session.CallSid)
 	callContext["conversation_history"] = conversationHistory
-	aiResponse := h.generateAIResponse(session.CallSid, transcribedText, callContext)
+	// Add custom_parameters to call context
+	session.Mu.RLock()
+	customParams := session.CustomParameters
+	session.Mu.RUnlock()
+	if customParams != nil {
+		callContext["custom_parameters"] = customParams
+	}
+	aiResponse := h.generateAIResponse(session, transcribedText, callContext)
 
 	// Step 4: Update conversation history with AI response
 	session.Mu.Lock()
@@ -645,19 +670,28 @@ func (h *Handler) processAudioBuffer(session *VoiceSession) {
 	h.sendTTSResponse(session, aiResponse)
 }
 
-// callSTTService calls Go STT service to convert audio to text
-func (h *Handler) callSTTService(audioData []byte) string {
-	if !h.cfg.FeatureAI || h.sttService == nil || !h.sttService.IsAvailable() {
+// callSTTService calls OpenAI Whisper to convert audio to text
+func (h *Handler) callSTTService(session *VoiceSession, audioData []byte) string {
+	if !h.cfg.FeatureAI || h.cfg.OpenAIApiKey == "" {
 		return ""
 	}
 
 	// Convert PCM to WAV format for STT service
 	// Note: OpenAI Whisper accepts raw PCM, but we'll format it as WAV
-	wavData := h.convertPCMToWAV(audioData)
+	session.Mu.RLock()
+	sampleRate := session.SampleRate
+	session.Mu.RUnlock()
+	if sampleRate == 0 {
+		sampleRate = 16000 // Default 16kHz
+	}
+	wavData := h.convertPCMToWAV(audioData, sampleRate)
 
+	// Use OpenAI Whisper directly
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Call OpenAI Whisper API
+	sttService := ai.NewSTTService(h.cfg.OpenAIApiKey, "whisper-1", "", 10*time.Second, h.logger)
 	sttReq := &ai.STTRequest{
 		AudioData:   wavData,
 		AudioFormat: "wav",
@@ -665,25 +699,27 @@ func (h *Handler) callSTTService(audioData []byte) string {
 		Prompt:      "",
 	}
 
-	sttResp, err := h.sttService.SpeechToText(ctx, sttReq)
+	sttResp, err := sttService.SpeechToText(ctx, sttReq)
 	if err != nil {
-		h.logger.Warn("STT service failed", zap.Error(err))
+		h.logger.Warn("OpenAI Whisper failed", zap.Error(err))
 		return ""
 	}
 
 	if sttResp == nil || sttResp.Text == "" {
-		h.logger.Warn("STT service returned empty text")
+		h.logger.Warn("OpenAI Whisper returned empty text")
 		return ""
 	}
 
 	return sttResp.Text
 }
 
-// convertPCMToWAV converts raw PCM (16-bit, 8kHz, mono) to WAV format
-func (h *Handler) convertPCMToWAV(pcmData []byte) []byte {
-	// WAV header for 16-bit PCM, 8kHz, mono
+// convertPCMToWAV converts raw PCM (16-bit, 16kHz, mono) to WAV format
+func (h *Handler) convertPCMToWAV(pcmData []byte, sampleRate int) []byte {
+	// WAV header for 16-bit PCM, 16kHz, mono
 	// This is a simplified WAV header - in production, use a proper WAV library
-	sampleRate := 8000
+	if sampleRate == 0 {
+		sampleRate = 16000 // Default 16kHz
+	}
 	bitsPerSample := 16
 	channels := 1
 	dataSize := len(pcmData)
@@ -745,7 +781,7 @@ func (h *Handler) convertPCMToWAV(pcmData []byte) []byte {
 
 // sendTTSResponse converts text to speech and streams audio back to Exotel
 func (h *Handler) sendTTSResponse(session *VoiceSession, text string) {
-	if !h.cfg.FeatureAI || h.ttsService == nil || !h.ttsService.IsAvailable() {
+	if !h.cfg.FeatureAI || h.cfg.OpenAIApiKey == "" {
 		h.sendTextResponse(session, text)
 		return
 	}
@@ -753,37 +789,38 @@ func (h *Handler) sendTTSResponse(session *VoiceSession, text string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	ttsReq := &ai.TTSRequest{
-		Text:            text,
-		VoiceID:         "",
-		ModelID:         "",
-		OutputFormat:    "",
-		Stability:       0.5,
-		SimilarityBoost: 0.5,
+	// Get voice from custom_parameters or use default
+	voice := "shimmer" // Default: female, super natural Hindi
+	if session.CustomParameters != nil {
+		if v, ok := session.CustomParameters["voice_id"].(string); ok && v != "" {
+			voice = v
+		}
 	}
 
-	mp3Data, err := h.ttsService.TextToSpeech(ctx, ttsReq)
+	// Use OpenAI TTS service
+	openAITTS := ai.NewOpenAITTSService(h.cfg.OpenAIApiKey, 10*time.Second, h.logger)
+	ttsReq := &ai.OpenAITTSRequest{
+		Text:   text,
+		Model:  "tts-1-hd", // Best quality
+		Voice:  voice,
+		Format: "mp3",
+		Speed:  1.0,
+	}
+
+	pcmData, err := openAITTS.TextToSpeechPCM(ctx, ttsReq)
 	if err != nil {
-		h.logger.Warn("TTS service failed", zap.Error(err))
+		h.logger.Warn("OpenAI TTS service failed", zap.Error(err))
 		h.sendTextResponse(session, text)
 		return
 	}
 
-	// Stream TTS audio in chunks
-	h.streamTTSAudio(session, mp3Data, "response_done")
+	// Stream PCM in 640-byte chunks
+	h.streamPCMAudio(session, pcmData, "response_done")
 }
 
-// streamTTSAudio converts MP3 to PCM and streams in 3200-byte chunks to Exotel
-// Sends media events with sequence_number as required by Exotel
-func (h *Handler) streamTTSAudio(session *VoiceSession, mp3Data []byte, markName string) {
-	// Convert MP3 to PCM chunks
-	chunks, err := audio.ConvertAndChunk(mp3Data, 3200)
-	if err != nil {
-		h.logger.Error("Failed to convert and chunk TTS audio", zap.Error(err))
-		h.sendTextResponse(session, "I'm sorry, I'm having trouble speaking right now.")
-		return
-	}
-
+// streamPCMAudio streams raw 16-bit 16kHz PCM in 640-byte chunks to Exotel
+// Sends media events with base64-encoded payload as required by Exotel
+func (h *Handler) streamPCMAudio(session *VoiceSession, pcmData []byte, markName string) {
 	session.Mu.RLock()
 	conn := session.Conn
 	streamSid := session.StreamSid
@@ -794,14 +831,27 @@ func (h *Handler) streamTTSAudio(session *VoiceSession, mp3Data []byte, markName
 		return
 	}
 
-	// Send each chunk as Exotel media event with sequence_number
-	for i, chunk := range chunks {
+	// Chunk PCM data into 640-byte chunks (no gaps)
+	chunkSize := 640
+	chunks := make([][]byte, 0)
+	for i := 0; i < len(pcmData); i += chunkSize {
+		end := i + chunkSize
+		if end > len(pcmData) {
+			end = len(pcmData)
+		}
+		chunks = append(chunks, pcmData[i:end])
+	}
+
+	// Send each chunk as Exotel media event with base64-encoded payload
+	for _, chunk := range chunks {
+		// Base64 encode the PCM chunk
+		base64Payload := audio.EncodePCMChunkToBase64(chunk)
+
 		mediaEvent := map[string]interface{}{
-			"event":           "media",
-			"stream_sid":      streamSid,
-			"sequence_number": fmt.Sprintf("%d", i), // Exotel requires sequence_number
+			"event":      "media",
+			"stream_sid": streamSid,
 			"media": map[string]interface{}{
-				"payload": chunk,
+				"payload": base64Payload,
 			},
 		}
 
@@ -816,10 +866,7 @@ func (h *Handler) streamTTSAudio(session *VoiceSession, mp3Data []byte, markName
 			return
 		}
 
-		// Small delay between chunks to avoid overwhelming the connection
-		if i < len(chunks)-1 {
-			time.Sleep(10 * time.Millisecond)
-		}
+		// No delay between chunks for low latency (<700ms requirement)
 	}
 
 	// Send mark event after all chunks
@@ -842,7 +889,7 @@ func (h *Handler) streamTTSAudio(session *VoiceSession, mp3Data []byte, markName
 		return
 	}
 
-	h.logger.Info("Streamed TTS audio",
+	h.logger.Info("Streamed PCM audio",
 		zap.String("call_sid", session.CallSid),
 		zap.Int("chunks", len(chunks)),
 		zap.String("mark", markName),
@@ -868,6 +915,29 @@ func (h *Handler) sendTextResponse(session *VoiceSession, text string) {
 
 	responseJSON, _ := json.Marshal(response)
 	conn.WriteMessage(websocket.TextMessage, responseJSON)
+}
+
+// handleClearEvent processes Exotel "clear" event for barge-in support
+func (h *Handler) handleClearEvent(callSid string, message []byte) {
+	h.logger.Info("Handling clear event (barge-in)",
+		zap.String("call_sid", callSid),
+	)
+
+	session := getSession(callSid)
+	if session != nil {
+		// Clear audio buffer to stop current processing
+		session.AudioBuffer.Clear()
+
+		// Cancel any ongoing processing
+		session.Mu.Lock()
+		if session.CancelCtx != nil {
+			session.CancelCtx()
+			// Create new cancel context
+			_, cancel := context.WithCancel(context.Background())
+			session.CancelCtx = cancel
+		}
+		session.Mu.Unlock()
+	}
 }
 
 // handleStopEvent processes Exotel "stop" event
@@ -972,39 +1042,10 @@ func (h *Handler) getCallContext(callSid string) map[string]interface{} {
 	return callContext
 }
 
-// generateAIResponse calls Go AI manager to generate conversational response
-func (h *Handler) generateAIResponse(callSid, userText string, callContext map[string]interface{}) string {
+// generateAIResponse calls OpenAI directly with dynamic system prompt from custom_parameters
+func (h *Handler) generateAIResponse(session *VoiceSession, userText string, callContext map[string]interface{}) string {
 	// If AI service is not enabled, return simple response
-	if !h.cfg.FeatureAI || h.aiManager == nil {
-		return "Thank you for your input. I understand you said: " + userText + ". How can I help you further?"
-	}
-
-	// Get persona ID from call context
-	personaIDVal, hasPersona := callContext["persona_id"]
-	if !hasPersona {
-		return "Thank you for your input. I understand you said: " + userText + ". How can I help you further?"
-	}
-
-	// Convert persona ID to int64
-	var personaID *int64
-	if idFloat, ok := personaIDVal.(float64); ok {
-		id := int64(idFloat)
-		personaID = &id
-	} else if idInt, ok := personaIDVal.(int64); ok {
-		personaID = &idInt
-	} else if idInt, ok := personaIDVal.(int); ok {
-		id := int64(idInt)
-		personaID = &id
-	} else {
-		if idStr, ok := personaIDVal.(string); ok {
-			var id int64
-			if _, err := fmt.Sscanf(idStr, "%d", &id); err == nil {
-				personaID = &id
-			}
-		}
-	}
-
-	if personaID == nil {
+	if !h.cfg.FeatureAI || h.cfg.OpenAIApiKey == "" {
 		return "Thank you for your input. I understand you said: " + userText + ". How can I help you further?"
 	}
 
@@ -1014,51 +1055,165 @@ func (h *Handler) generateAIResponse(callSid, userText string, callContext map[s
 		conversationHistory = hist
 	}
 
-	// Build RAG context if persona loader is available
-	var ragContext map[string]interface{}
-	if h.personaLoader != nil {
-		ctxBg := context.Background()
-		ragCtx, err := h.personaLoader.BuildRAGContext(ctxBg, personaID)
-		if err == nil && ragCtx != nil {
-			ragContext = ragCtx
+	// Build dynamic system prompt from custom_parameters
+	systemPrompt := h.buildSystemPromptFromCustomParams(session.CustomParameters)
+
+	// Build messages for OpenAI
+	messages := []map[string]interface{}{
+		{"role": "system", "content": systemPrompt},
+	}
+
+	// Add conversation history
+	for _, msg := range conversationHistory {
+		if role, ok := msg["role"].(string); ok {
+			if content, ok := msg["content"].(string); ok {
+				messages = append(messages, map[string]interface{}{
+					"role":    role,
+					"content": content,
+				})
+			}
 		}
 	}
 
-	// Build context for AI request
-	aiContext := map[string]interface{}{
-		"call_sid":    callSid,
-		"campaign_id": callContext["campaign_id"],
-		"contact_id":  callContext["contact_id"],
-	}
+	// Add current user message
+	messages = append(messages, map[string]interface{}{
+		"role":    "user",
+		"content": userText,
+	})
 
-	// Add RAG context if available
-	if ragContext != nil {
-		aiContext["rag_context"] = ragContext
-	}
-
-	// Use Go AI manager
-	conversationReq := &ai.ConversationRequest{
-		UserText:            userText,
-		PersonaID:           personaID,
-		ConversationHistory: conversationHistory,
-		Context:             aiContext,
-	}
-
+	// Call OpenAI API directly
 	ctxBg := context.Background()
 	ctx, cancel := context.WithTimeout(ctxBg, time.Duration(h.cfg.AITimeoutMs)*time.Millisecond)
 	defer cancel()
 
-	response, err := h.aiManager.GenerateConversationResponse(ctx, conversationReq)
+	requestBody := map[string]interface{}{
+		"model":       h.cfg.OpenAIModel,
+		"messages":    messages,
+		"max_tokens":  h.cfg.OpenAIMaxTokens,
+		"temperature": 0.7,
+	}
+
+	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
-		h.logger.Warn("AI service conversation failed", zap.Error(err))
+		h.logger.Warn("Failed to marshal OpenAI request", zap.Error(err))
 		return "I understand you said: " + userText + ". How can I help you further?"
 	}
 
-	if response == "" {
+	url := "https://api.openai.com/v1/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		h.logger.Warn("Failed to create OpenAI request", zap.Error(err))
 		return "I understand you said: " + userText + ". How can I help you further?"
 	}
 
-	return response
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+h.cfg.OpenAIApiKey)
+
+	client := &http.Client{Timeout: time.Duration(h.cfg.AITimeoutMs) * time.Millisecond}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		h.logger.Warn("OpenAI API request failed", zap.Error(err))
+		return "I understand you said: " + userText + ". How can I help you further?"
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		h.logger.Warn("OpenAI API error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+		return "I understand you said: " + userText + ". How can I help you further?"
+	}
+
+	var openAIResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&openAIResp); err != nil {
+		h.logger.Warn("Failed to decode OpenAI response", zap.Error(err))
+		return "I understand you said: " + userText + ". How can I help you further?"
+	}
+
+	if len(openAIResp.Choices) == 0 {
+		return "I understand you said: " + userText + ". How can I help you further?"
+	}
+
+	return strings.TrimSpace(openAIResp.Choices[0].Message.Content)
+}
+
+// buildSystemPromptFromCustomParams builds dynamic system prompt from custom_parameters
+func (h *Handler) buildSystemPromptFromCustomParams(customParams map[string]interface{}) string {
+	if customParams == nil {
+		return "You are a helpful AI assistant. Provide concise, professional responses."
+	}
+
+	var parts []string
+
+	// Extract persona information
+	personaName := getStringFromMap(customParams, "persona_name", "")
+	personaAge := getStringFromMap(customParams, "persona_age", "")
+	tone := getStringFromMap(customParams, "tone", "")
+	gender := getStringFromMap(customParams, "gender", "")
+	city := getStringFromMap(customParams, "city", "")
+	language := getStringFromMap(customParams, "language", "")
+	documents := getStringFromMap(customParams, "documents", "")
+	customerName := getStringFromMap(customParams, "customer_name", "")
+
+	// Build persona description
+	if personaName != "" {
+		personaDesc := fmt.Sprintf("You are %s", personaName)
+		if personaAge != "" {
+			personaDesc += fmt.Sprintf(", %s saal ki", personaAge)
+		}
+		if tone != "" {
+			personaDesc += fmt.Sprintf(" %s", tone)
+		}
+		if gender != "" {
+			personaDesc += fmt.Sprintf(" %s", gender)
+		}
+		if city != "" {
+			personaDesc += fmt.Sprintf(" from %s", city)
+		}
+		personaDesc += "."
+		parts = append(parts, personaDesc)
+	}
+
+	// Add language instruction
+	if language != "" {
+		langInstruction := fmt.Sprintf("Baat karo %s mein", language)
+		if strings.ToLower(language) == "hindi" {
+			langInstruction += " (Hinglish if Hindi)."
+		}
+		parts = append(parts, langInstruction)
+	}
+
+	// Add documents instruction
+	if documents != "" {
+		parts = append(parts, fmt.Sprintf("Sirf in documents se jawab do: %s", documents))
+	}
+
+	// Add customer name
+	if customerName != "" {
+		parts = append(parts, fmt.Sprintf("Customer ka naam: %s", customerName))
+	}
+
+	if len(parts) > 0 {
+		return strings.Join(parts, " ")
+	}
+
+	return "You are a helpful AI assistant. Provide concise, professional responses."
+}
+
+// getStringFromMap safely extracts string from map
+func getStringFromMap(m map[string]interface{}, key, defaultValue string) string {
+	if val, ok := m[key]; ok {
+		if str, ok := val.(string); ok {
+			return str
+		}
+	}
+	return defaultValue
 }
 
 // finalizeCallRecord updates call record when session ends
