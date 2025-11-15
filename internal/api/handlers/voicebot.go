@@ -635,30 +635,12 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		Eq("call_sid", req.CallSid).
 		UpdateOne(ctxUpdate, updateData)
 
-	// Get base URL - prefer configured URL, fallback to request-based detection
+	// CRITICAL: Use exact base URL: https://zoro-yvye.onrender.com
+	// Prefer configured URL, otherwise use production URL
 	baseURL := h.cfg.VoicebotBaseURL
 	if baseURL == "" {
-		// Fallback: construct from request headers (works behind reverse proxy)
-		scheme := "https"
-
-		// Check X-Forwarded-Proto header (set by reverse proxy)
-		if proto := c.GetHeader("X-Forwarded-Proto"); proto == "http" {
-			scheme = "http"
-		} else if c.Request.TLS == nil {
-			// Direct connection without TLS
-			scheme = "http"
-		}
-
-		// Get host from X-Forwarded-Host (reverse proxy) or Host header
-		host := c.GetHeader("X-Forwarded-Host")
-		if host == "" {
-			host = c.GetHeader("Host")
-		}
-		if host == "" {
-			host = c.Request.Host
-		}
-
-		baseURL = fmt.Sprintf("%s://%s", scheme, host)
+		// Use production URL
+		baseURL = "https://zoro-yvye.onrender.com"
 	}
 
 	// Ensure baseURL doesn't have trailing slash
@@ -666,8 +648,8 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		baseURL = baseURL[:len(baseURL)-1]
 	}
 
-	// Replace http/https with ws/wss for WebSocket URL
-	// Production MUST use wss://, development can use ws://
+	// CRITICAL: Replace http/https with ws/wss for WebSocket URL
+	// Production MUST use wss://
 	wsBaseURL := baseURL
 	if len(wsBaseURL) >= 5 {
 		if wsBaseURL[:5] == "https" {
@@ -677,10 +659,8 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		}
 	}
 
-	// WebSocket endpoint with call parameters - use /was as per requirements
-	// Use CORRECTED virtual number and target number (not Exotel's potentially incorrect values)
-	// URL encode all parameters to handle special characters properly
-	// CRITICAL: Use exact format: wss://zoro-yvye.onrender.com/was?sample-rate=16000
+	// CRITICAL: Use exact format as requested: wss://zoro-yvye.onrender.com/was?sample-rate=16000
+	// Add additional parameters for call tracking
 	wsURL := fmt.Sprintf("%s/was?sample-rate=16000&call_sid=%s&from=%s&to=%s",
 		wsBaseURL,
 		url.QueryEscape(req.CallSid),
@@ -688,9 +668,16 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 		url.QueryEscape(targetNumber),  // Use corrected target number
 	)
 	
-	// Ensure WSS protocol (not WS)
+	// CRITICAL: Ensure WSS protocol (not WS) - production MUST use wss://
 	if strings.HasPrefix(wsURL, "ws://") {
 		wsURL = strings.Replace(wsURL, "ws://", "wss://", 1)
+	}
+	
+	// Final validation: Ensure URL starts with wss://
+	if !strings.HasPrefix(wsURL, "wss://") {
+		// Force wss:// protocol
+		wsURL = strings.Replace(wsURL, "http://", "wss://", 1)
+		wsURL = strings.Replace(wsURL, "https://", "wss://", 1)
 	}
 
 	h.logger.Info("Generated WebSocket URL for Exotel",
@@ -1670,6 +1657,7 @@ func (h *Handler) getCallContext(callSid string) map[string]interface{} {
 }
 
 // generateAIResponse calls OpenAI directly with dynamic system prompt from custom_parameters
+// CRITICAL: Loads persona and documents from MongoDB if persona_id is available
 func (h *Handler) generateAIResponse(session *VoiceSession, userText string, callContext map[string]interface{}) string {
 	// If AI service is not enabled, return simple response
 	if !h.cfg.FeatureAI || h.cfg.OpenAIApiKey == "" {
@@ -1682,8 +1670,70 @@ func (h *Handler) generateAIResponse(session *VoiceSession, userText string, cal
 		conversationHistory = hist
 	}
 
-	// Build dynamic system prompt from custom_parameters
-	systemPrompt := h.buildSystemPromptFromCustomParams(session.CustomParameters)
+	// CRITICAL: Load persona and documents from MongoDB if personaLoader is available
+	var ragContext map[string]interface{}
+	if h.personaLoader != nil {
+		// Try to get persona_id from callContext (from campaign) or custom_parameters
+		var personaID *int64
+		
+		// First try: Get from callContext (from campaign)
+		if personaIDVal, ok := callContext["persona_id"]; ok && personaIDVal != nil {
+			// Try to convert to int64
+			if pid, ok := personaIDVal.(int64); ok {
+				personaID = &pid
+			} else if pidStr, ok := personaIDVal.(string); ok {
+				if pidInt, err := strconv.ParseInt(pidStr, 10, 64); err == nil {
+					personaID = &pidInt
+				}
+			} else if pidFloat, ok := personaIDVal.(float64); ok {
+				pidInt := int64(pidFloat)
+				personaID = &pidInt
+			}
+		}
+		
+		// Second try: Get from custom_parameters
+		if personaID == nil && session.CustomParameters != nil {
+			if pidVal, ok := session.CustomParameters["persona_id"]; ok && pidVal != nil {
+				if pid, ok := pidVal.(int64); ok {
+					personaID = &pid
+				} else if pidStr, ok := pidVal.(string); ok {
+					if pidInt, err := strconv.ParseInt(pidStr, 10, 64); err == nil {
+						personaID = &pidInt
+					}
+				} else if pidFloat, ok := pidVal.(float64); ok {
+					pidInt := int64(pidFloat)
+					personaID = &pidInt
+				}
+			}
+		}
+
+		// Load RAG context (persona data + documents) if persona_id is available
+		if personaID != nil {
+			ctxBg := context.Background()
+			ctx, cancel := context.WithTimeout(ctxBg, 5*time.Second)
+			ragCtx, err := h.personaLoader.BuildRAGContext(ctx, personaID)
+			cancel()
+			
+			if err == nil && ragCtx != nil {
+				ragContext = ragCtx
+				h.logger.Info("Loaded RAG context from MongoDB",
+					zap.String("call_sid", session.CallSid),
+					zap.Int64("persona_id", *personaID),
+					zap.Bool("has_persona_data", ragContext["persona_data"] != nil),
+					zap.Bool("has_document_text", ragContext["document_text"] != nil && ragContext["document_text"] != ""),
+				)
+			} else {
+				h.logger.Warn("Failed to load RAG context",
+					zap.String("call_sid", session.CallSid),
+					zap.Int64("persona_id", *personaID),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+
+	// Build dynamic system prompt from custom_parameters and RAG context
+	systemPrompt := h.buildSystemPromptFromCustomParamsAndRAG(session.CustomParameters, ragContext)
 
 	// Build messages for OpenAI
 	messages := []map[string]interface{}{
@@ -1770,60 +1820,119 @@ func (h *Handler) generateAIResponse(session *VoiceSession, userText string, cal
 	return strings.TrimSpace(openAIResp.Choices[0].Message.Content)
 }
 
-// buildSystemPromptFromCustomParams builds dynamic system prompt from custom_parameters
-func (h *Handler) buildSystemPromptFromCustomParams(customParams map[string]interface{}) string {
-	if customParams == nil {
-		return "You are a helpful AI assistant. Provide concise, professional responses."
-	}
-
+// buildSystemPromptFromCustomParamsAndRAG builds dynamic system prompt from custom_parameters and RAG context
+// CRITICAL: This combines persona data from MongoDB with custom_parameters
+func (h *Handler) buildSystemPromptFromCustomParamsAndRAG(customParams map[string]interface{}, ragContext map[string]interface{}) string {
 	var parts []string
 
-	// Extract persona information
-	personaName := getStringFromMap(customParams, "persona_name", "")
-	personaAge := getStringFromMap(customParams, "persona_age", "")
-	tone := getStringFromMap(customParams, "tone", "")
-	gender := getStringFromMap(customParams, "gender", "")
-	city := getStringFromMap(customParams, "city", "")
-	language := getStringFromMap(customParams, "language", "")
-	documents := getStringFromMap(customParams, "documents", "")
-	customerName := getStringFromMap(customParams, "customer_name", "")
+	// CRITICAL: Priority 1: Use persona data from MongoDB (RAG context) if available
+	if ragContext != nil {
+		personaData, hasPersonaData := ragContext["persona_data"].(map[string]interface{})
+		documentText, hasDocText := ragContext["document_text"].(string)
 
-	// Build persona description
-	if personaName != "" {
-		personaDesc := fmt.Sprintf("You are %s", personaName)
-		if personaAge != "" {
-			personaDesc += fmt.Sprintf(", %s saal ki", personaAge)
+		// Extract persona information from MongoDB
+		if hasPersonaData && personaData != nil {
+			personaName := getStringFromMap(personaData, "name", "")
+			personaAge := getStringFromMap(personaData, "age", "")
+			tone := getStringFromMap(personaData, "tone", "")
+			gender := getStringFromMap(personaData, "gender", "")
+			city := getStringFromMap(personaData, "city", "")
+			language := getStringFromMap(personaData, "language", "")
+
+			// Build persona description from MongoDB data
+			if personaName != "" {
+				personaDesc := fmt.Sprintf("You are %s", personaName)
+				if personaAge != "" {
+					personaDesc += fmt.Sprintf(", %s saal ki", personaAge)
+				}
+				if tone != "" {
+					personaDesc += fmt.Sprintf(" %s", tone)
+				}
+				if gender != "" {
+					personaDesc += fmt.Sprintf(" %s", gender)
+				}
+				if city != "" {
+					personaDesc += fmt.Sprintf(" from %s", city)
+				}
+				personaDesc += "."
+				parts = append(parts, personaDesc)
+			}
+
+			// Add language instruction from MongoDB
+			if language != "" {
+				langInstruction := fmt.Sprintf("Baat karo %s mein", language)
+				if strings.ToLower(language) == "hindi" {
+					langInstruction += " (Hinglish if Hindi)."
+				}
+				parts = append(parts, langInstruction)
+			}
+
+			// Add additional persona fields from MongoDB if available
+			if script, ok := personaData["script"].(string); ok && script != "" {
+				parts = append(parts, fmt.Sprintf("Follow this script: %s", script))
+			}
 		}
-		if tone != "" {
-			personaDesc += fmt.Sprintf(" %s", tone)
+
+		// Add document text from MongoDB (RAG context)
+		if hasDocText && documentText != "" && len(documentText) > 0 {
+			// Include document content in system prompt (truncate if too long)
+			maxDocLength := 2000 // Limit document text to avoid token limit
+			if len(documentText) > maxDocLength {
+				documentText = documentText[:maxDocLength] + "..."
+			}
+			parts = append(parts, fmt.Sprintf("Use the following information from documents to answer questions: %s", documentText))
 		}
-		if gender != "" {
-			personaDesc += fmt.Sprintf(" %s", gender)
-		}
-		if city != "" {
-			personaDesc += fmt.Sprintf(" from %s", city)
-		}
-		personaDesc += "."
-		parts = append(parts, personaDesc)
 	}
 
-	// Add language instruction
-	if language != "" {
-		langInstruction := fmt.Sprintf("Baat karo %s mein", language)
-		if strings.ToLower(language) == "hindi" {
-			langInstruction += " (Hinglish if Hindi)."
+	// Priority 2: Use custom_parameters as fallback or override
+	if customParams != nil {
+		// Only use custom_parameters if RAG context doesn't have this data
+		personaName := getStringFromMap(customParams, "persona_name", "")
+		personaAge := getStringFromMap(customParams, "persona_age", "")
+		tone := getStringFromMap(customParams, "tone", "")
+		gender := getStringFromMap(customParams, "gender", "")
+		city := getStringFromMap(customParams, "city", "")
+		language := getStringFromMap(customParams, "language", "")
+		documents := getStringFromMap(customParams, "documents", "")
+		customerName := getStringFromMap(customParams, "customer_name", "")
+
+		// Build persona description from custom_parameters if not already set from RAG
+		if personaName != "" && len(parts) == 0 {
+			personaDesc := fmt.Sprintf("You are %s", personaName)
+			if personaAge != "" {
+				personaDesc += fmt.Sprintf(", %s saal ki", personaAge)
+			}
+			if tone != "" {
+				personaDesc += fmt.Sprintf(" %s", tone)
+			}
+			if gender != "" {
+				personaDesc += fmt.Sprintf(" %s", gender)
+			}
+			if city != "" {
+				personaDesc += fmt.Sprintf(" from %s", city)
+			}
+			personaDesc += "."
+			parts = append(parts, personaDesc)
 		}
-		parts = append(parts, langInstruction)
-	}
 
-	// Add documents instruction
-	if documents != "" {
-		parts = append(parts, fmt.Sprintf("Sirf in documents se jawab do: %s", documents))
-	}
+		// Add language instruction from custom_parameters if not already set
+		if language != "" && len(parts) == 0 {
+			langInstruction := fmt.Sprintf("Baat karo %s mein", language)
+			if strings.ToLower(language) == "hindi" {
+				langInstruction += " (Hinglish if Hindi)."
+			}
+			parts = append(parts, langInstruction)
+		}
 
-	// Add customer name
-	if customerName != "" {
-		parts = append(parts, fmt.Sprintf("Customer ka naam: %s", customerName))
+		// Add documents instruction (if not already included from RAG)
+		if documents != "" {
+			parts = append(parts, fmt.Sprintf("Sirf in documents se jawab do: %s", documents))
+		}
+
+		// Add customer name
+		if customerName != "" {
+			parts = append(parts, fmt.Sprintf("Customer ka naam: %s", customerName))
+		}
 	}
 
 	if len(parts) > 0 {
@@ -1831,6 +1940,11 @@ func (h *Handler) buildSystemPromptFromCustomParams(customParams map[string]inte
 	}
 
 	return "You are a helpful AI assistant. Provide concise, professional responses."
+}
+
+// buildSystemPromptFromCustomParams builds dynamic system prompt from custom_parameters only (legacy function)
+func (h *Handler) buildSystemPromptFromCustomParams(customParams map[string]interface{}) string {
+	return h.buildSystemPromptFromCustomParamsAndRAG(customParams, nil)
 }
 
 // getStringFromMap safely extracts string from map
