@@ -121,17 +121,46 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 			data.Set("CustomField", targetNumber)
 		}
 
-		// CRITICAL: Log warning about Applet limitation
-		fmt.Printf("[WARNING] Using AppletID=%s - Exotel may ignore To parameter!\n", req.AppletID)
-		fmt.Printf("[WARNING] Target number %s may not be used by Exotel Applet\n", targetNumber)
-		fmt.Printf("[WARNING] Solution: Configure Applet in Exotel Dashboard to use To parameter\n")
+		// CRITICAL: Validate that target number is not same as From/CallerID
+		if targetNumber != "" && fromNumber != "" {
+			// Normalize for comparison
+			targetNorm := strings.ReplaceAll(targetNumber, " ", "")
+			targetNorm = strings.ReplaceAll(targetNorm, "-", "")
+			targetNorm = strings.ReplaceAll(targetNorm, "+", "")
+			fromNorm := strings.ReplaceAll(fromNumber, " ", "")
+			fromNorm = strings.ReplaceAll(fromNorm, "-", "")
+			fromNorm = strings.ReplaceAll(fromNorm, "+", "")
+			
+			// Remove country code prefix for comparison
+			if strings.HasPrefix(targetNorm, "91") && len(targetNorm) == 12 {
+				targetNorm = targetNorm[2:]
+			}
+			if strings.HasPrefix(fromNorm, "91") && len(fromNorm) == 12 {
+				fromNorm = fromNorm[2:]
+			}
+			// Remove leading 0 for comparison
+			if strings.HasPrefix(targetNorm, "0") {
+				targetNorm = targetNorm[1:]
+			}
+			if strings.HasPrefix(fromNorm, "0") {
+				fromNorm = fromNorm[1:]
+			}
+			
+			if targetNorm == fromNorm {
+				fmt.Printf("[ERROR] CRITICAL: Target number matches From number! This will cause self-call!\n")
+				fmt.Printf("[ERROR] From=%s, To=%s (normalized: %s == %s)\n", fromNumber, targetNumber, fromNorm, targetNorm)
+			}
+		}
 
-		// Note: When AppletID is set, Exotel uses Applet's internal configuration
-		// The Applet MUST be configured in Exotel Dashboard to:
-		// 1. Accept To parameter from API calls, OR
-		// 2. Use UserData.target_number, OR
-		// 3. Use CustomField
-		// Otherwise, Exotel will create self-calls (From=To=VirtualNumber)
+		// CRITICAL: Log warning about Applet limitation
+		fmt.Printf("[INFO] Exotel ConnectCall Request:\n")
+		fmt.Printf("  - From: %s\n", fromNumber)
+		fmt.Printf("  - To: %s\n", targetNumber)
+		fmt.Printf("  - CallerId: %s\n", req.CallerID)
+		fmt.Printf("  - AppletID: %s\n", req.AppletID)
+		fmt.Printf("[WARNING] Using AppletID=%s - Ensure Applet URL in Dashboard is:\n", req.AppletID)
+		fmt.Printf("[WARNING] https://zoro-yvye.onrender.com/voicebot/init?target_number={{To}}\n")
+		fmt.Printf("[WARNING] Otherwise Exotel may create self-calls (From=To=VirtualNumber)\n")
 	} else {
 		// Regular call (non-Voicebot)
 		data.Set("From", req.From)
