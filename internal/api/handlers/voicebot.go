@@ -680,12 +680,18 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	// WebSocket endpoint with call parameters - use /was as per requirements
 	// Use CORRECTED virtual number and target number (not Exotel's potentially incorrect values)
 	// URL encode all parameters to handle special characters properly
+	// CRITICAL: Use exact format: wss://zoro-yvye.onrender.com/was?sample-rate=16000
 	wsURL := fmt.Sprintf("%s/was?sample-rate=16000&call_sid=%s&from=%s&to=%s",
 		wsBaseURL,
 		url.QueryEscape(req.CallSid),
 		url.QueryEscape(virtualNumber), // Use corrected virtual number
 		url.QueryEscape(targetNumber),  // Use corrected target number
 	)
+	
+	// Ensure WSS protocol (not WS)
+	if strings.HasPrefix(wsURL, "ws://") {
+		wsURL = strings.Replace(wsURL, "ws://", "wss://", 1)
+	}
 
 	h.logger.Info("Generated WebSocket URL for Exotel",
 		zap.String("call_sid", req.CallSid),

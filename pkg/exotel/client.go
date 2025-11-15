@@ -73,15 +73,19 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 	// - Url = Voicebot Applet URL that returns WebSocket URL
 	// - AppletID is used to route through the Voicebot Applet
 
-	// CRITICAL: Use HCall pattern - build voicebot URL if AppletID is provided
-	// HCall uses: http://my.exotel.com/{sid}/exoml/start_voice/{appId}
-	// This is more reliable than using AppletID parameter
+	// CRITICAL: Use direct HTTPS endpoint that returns WSS URL
+	// This endpoint will return: wss://zoro-yvye.onrender.com/was?sample-rate=16000
+	// This is more reliable than using AppletID parameter or Exotel URL pattern
 	var voicebotUrl string
 	if req.Url != "" {
 		// Use provided URL directly
 		voicebotUrl = req.Url
-	} else if req.AppletID != "" && req.AccountSID != "" {
-		// Build URL from AppletID and AccountSID (HCall pattern)
+	} else if req.AppletID != "" {
+		// Use direct HTTPS endpoint that returns WSS URL
+		// This endpoint returns: {"websocket_url": "wss://zoro-yvye.onrender.com/was?sample-rate=16000"}
+		voicebotUrl = "https://zoro-yvye.onrender.com/voicebot/init"
+	} else if req.AccountSID != "" {
+		// Fallback: Build Exotel URL pattern (HCall style)
 		voicebotUrl = fmt.Sprintf("http://my.exotel.com/%s/exoml/start_voice/%s", req.AccountSID, req.AppletID)
 	}
 
@@ -136,34 +140,38 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 			return nil, fmt.Errorf("CRITICAL: Customer number (%s) matches Exophone (%s) - this will cause self-call", customerNumber, fromNumber)
 		}
 
-		// Set parameters using HCall pattern
+		// Set parameters using direct URL pattern (recommended)
 		if voicebotUrl != "" {
-			// Use Url parameter (HCall pattern - more reliable)
-			data.Set("From", customerNumber)      // Customer number to call (HCall pattern)
+			// Use Url parameter with direct HTTPS endpoint
+			// This endpoint returns WSS URL: wss://zoro-yvye.onrender.com/was?sample-rate=16000
+			data.Set("From", customerNumber)      // Customer number to call
 			data.Set("CallerId", fromNumber)      // Exophone (what shows on caller ID)
-			data.Set("Url", voicebotUrl)          // Voicebot applet URL (HCall pattern)
+			data.Set("Url", voicebotUrl)          // HTTPS endpoint that returns WSS URL
 			if req.CustomField != "" {
 				data.Set("CustomField", req.CustomField)
 			}
 		} else {
-			// Fallback: Use AppletID (current pattern)
+			// Fallback: Use AppletID (less reliable)
 			data.Set("From", fromNumber)       // Virtual Exophone (makes the call)
 			data.Set("To", customerNumber)     // Target number (customer we're calling)
 			data.Set("CallerId", req.CallerID) // Virtual Exophone (caller ID)
 			data.Set("CallType", req.CallType)
 		}
 
-		// Log the actual parameters being sent (HCall pattern)
+		// Log the actual parameters being sent
 		if voicebotUrl != "" {
-			fmt.Printf("[INFO] Exotel ConnectCall Request (HCall Pattern):\n")
+			fmt.Printf("[INFO] Exotel ConnectCall Request (Direct URL Pattern):\n")
 			fmt.Printf("  - From (Customer): %s\n", customerNumber)
 			fmt.Printf("  - CallerId (Exophone): %s\n", fromNumber)
-			fmt.Printf("  - Url (Voicebot): %s\n", voicebotUrl)
+			fmt.Printf("  - Url (HTTPS Endpoint): %s\n", voicebotUrl)
+			fmt.Printf("  - Expected WSS Response: wss://zoro-yvye.onrender.com/was?sample-rate=16000\n")
 			if req.CustomField != "" {
 				fmt.Printf("  - CustomField: %s\n", req.CustomField)
 			}
-			fmt.Printf("  - AppletID: %s\n", req.AppletID)
-			fmt.Printf("[INFO] Using HCall pattern - more reliable than AppletID parameter\n")
+			if req.AppletID != "" {
+				fmt.Printf("  - AppletID: %s\n", req.AppletID)
+			}
+			fmt.Printf("[INFO] Using direct HTTPS endpoint - returns WSS URL automatically\n")
 		} else {
 			// Fallback logging for AppletID pattern
 			fmt.Printf("[INFO] Exotel ConnectCall Request (AppletID Pattern):\n")
