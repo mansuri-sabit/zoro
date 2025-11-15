@@ -485,14 +485,30 @@ func (h *Handler) ExotelVoicebotEndpoint(c *gin.Context) {
 	// 3. Other fallback methods
 
 	// Priority 1: Use target_number from URL parameter if available (from Exotel Applet URL config)
-	if targetNumberFromURL != "" && normalizePhoneNumber(targetNumberFromURL) != normalizePhoneNumber(virtualNumber) {
-		targetNumber = targetNumberFromURL
-		h.logger.Info("Using target number from URL parameter (Exotel Applet configuration)",
-			zap.String("call_sid", req.CallSid),
-			zap.String("target_number_from_url", targetNumberFromURL),
-			zap.String("exotel_to", req.To),
-		)
-	} else if originalCall != nil {
+	// BUT: Check if it's a literal template variable ({{To}}) - Exotel didn't resolve it
+	if targetNumberFromURL != "" {
+		// Check if target_number is a literal template variable (not resolved by Exotel)
+		if strings.HasPrefix(targetNumberFromURL, "{{") && strings.HasSuffix(targetNumberFromURL, "}}") {
+			// Exotel didn't resolve the template variable - ignore it and use fallback
+			h.logger.Warn("Exotel Applet did not resolve template variable - using fallback",
+				zap.String("call_sid", req.CallSid),
+				zap.String("unresolved_template", targetNumberFromURL),
+				zap.String("exotel_to", req.To),
+			)
+			targetNumberFromURL = "" // Clear it so we use fallback
+		} else if normalizePhoneNumber(targetNumberFromURL) != normalizePhoneNumber(virtualNumber) {
+			// Valid target number from URL - use it
+			targetNumber = targetNumberFromURL
+			h.logger.Info("Using target number from URL parameter (Exotel Applet configuration)",
+				zap.String("call_sid", req.CallSid),
+				zap.String("target_number_from_url", targetNumberFromURL),
+				zap.String("exotel_to", req.To),
+			)
+		}
+	}
+
+	// Priority 2: Use original call record if URL parameter was not valid
+	if targetNumber == "" && originalCall != nil {
 		// Priority 2: Use original call record's to_number (it's the source of truth)
 		originalTo := getString(originalCall, "to_number")
 		if originalTo != "" && normalizePhoneNumber(originalTo) != normalizePhoneNumber(virtualNumber) {
