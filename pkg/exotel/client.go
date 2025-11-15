@@ -48,6 +48,7 @@ type ConnectCallRequest struct {
 	// Additional parameters for Voicebot Applets
 	CustomField string // Custom field to pass target number (alternative to To)
 	UserData    string // User data JSON string (alternative to To)
+	Url         string // Voicebot URL (alternative to AppletID) - format: http://my.exotel.com/{sid}/exoml/start_voice/{appId}
 }
 
 type ConnectCallResponse struct {
@@ -72,95 +73,106 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 	// - Url = Voicebot Applet URL that returns WebSocket URL
 	// - AppletID is used to route through the Voicebot Applet
 
-	if req.AppletID != "" {
-		// Voicebot Applet call: Use correct mapping for Exotel API
-		// CRITICAL: For Exotel ConnectCall API with Voicebot Applets:
-		// - From = Virtual Exophone (the number that will make the call)
-		// - To = Target number (customer we're calling) - MUST be set correctly
-		// - CallerId = Virtual Exophone (what shows on caller ID - same as From)
-		//
-		// IMPORTANT: Exotel Voicebot Applets IGNORE the To parameter when AppletID is used
-		// The Applet uses its internal flow configuration instead
-		// Solution: Configure Applet in Exotel Dashboard OR use direct URL (without AppletID)
+	// CRITICAL: Use HCall pattern - build voicebot URL if AppletID is provided
+	// HCall uses: http://my.exotel.com/{sid}/exoml/start_voice/{appId}
+	// This is more reliable than using AppletID parameter
+	var voicebotUrl string
+	if req.Url != "" {
+		// Use provided URL directly
+		voicebotUrl = req.Url
+	} else if req.AppletID != "" && req.AccountSID != "" {
+		// Build URL from AppletID and AccountSID (HCall pattern)
+		voicebotUrl = fmt.Sprintf("http://my.exotel.com/%s/exoml/start_voice/%s", req.AccountSID, req.AppletID)
+	}
 
-		// Use CallerID as From (Virtual Exophone makes the call)
+	if voicebotUrl != "" || req.AppletID != "" {
+		// Voicebot Applet call: Use HCall pattern which is more reliable
+		// HCall uses: From = customer number, CallerId = Exophone, Url = voicebot URL
+		//
+		// CRITICAL: For Exotel ConnectCall API with Voicebot Applets (HCall pattern):
+		// - From = Customer number (who to call) - HCall pattern
+		// - To = NOT USED in v1 API for Voicebot calls
+		// - CallerId = Exophone (what shows on recipient's phone)
+		// - Url = Voicebot applet URL (http://my.exotel.com/{sid}/exoml/start_voice/{appId})
+
+		// Use CallerID as From if not provided (should be Exophone)
 		fromNumber := req.CallerID
 		if fromNumber == "" {
-			// Fallback: if CallerID not provided, use From (should be Exophone)
 			fromNumber = req.From
 		}
 
-		// CRITICAL: Normalize target number to ensure consistent format
-		targetNumber := req.To
-
-		// CRITICAL: Set To parameter - even though Exotel might ignore it for Applets
-		// We still send it in case Exotel fixes this behavior or Applet is configured to use it
-		data.Set("From", fromNumber)       // Virtual Exophone (makes the call)
-		data.Set("To", targetNumber)       // Target number (customer we're calling) - CRITICAL
-		data.Set("CallerId", req.CallerID) // Virtual Exophone (caller ID)
-		data.Set("CallType", req.CallType)
-
-		// CRITICAL: For Voicebot Applets, also pass target number in UserData
-		// This ensures Exotel preserves it even if To parameter is ignored
-		// Some Applets can access UserData from their flow
-		if req.UserData != "" {
-			// Use UserData from request if provided
-			data.Set("UserData", req.UserData)
-		} else if targetNumber != "" {
-			// Fallback: generate UserData with target number
-			data.Set("UserData", fmt.Sprintf(`{"target_number":"%s","to_number":"%s","To":"%s"}`, targetNumber, targetNumber, targetNumber))
+		// CRITICAL: Use To parameter as the customer number (HCall pattern)
+		// In HCall, From parameter contains the customer number
+		customerNumber := req.To
+		if customerNumber == "" {
+			// Fallback: if To not provided, try From (should contain customer number)
+			customerNumber = req.From
 		}
 
-		// CRITICAL: Also try passing as CustomField if Exotel supports it
-		// Some Exotel configurations use CustomField for target numbers
-		if req.CustomField != "" {
-			// Use CustomField from request if provided
-			data.Set("CustomField", req.CustomField)
-		} else if targetNumber != "" {
-			// Fallback: use target number as CustomField
-			data.Set("CustomField", targetNumber)
+		// CRITICAL: Validate that customer number is not same as Exophone
+		normalizedCustomer := strings.ReplaceAll(customerNumber, " ", "")
+		normalizedCustomer = strings.ReplaceAll(normalizedCustomer, "-", "")
+		normalizedCustomer = strings.ReplaceAll(normalizedCustomer, "+", "")
+		normalizedFrom := strings.ReplaceAll(fromNumber, " ", "")
+		normalizedFrom = strings.ReplaceAll(normalizedFrom, "-", "")
+		normalizedFrom = strings.ReplaceAll(normalizedFrom, "+", "")
+		
+		// Remove country code prefix for comparison
+		if strings.HasPrefix(normalizedCustomer, "91") && len(normalizedCustomer) == 12 {
+			normalizedCustomer = normalizedCustomer[2:]
+		}
+		if strings.HasPrefix(normalizedFrom, "91") && len(normalizedFrom) == 12 {
+			normalizedFrom = normalizedFrom[2:]
+		}
+		// Remove leading 0 for comparison
+		if strings.HasPrefix(normalizedCustomer, "0") {
+			normalizedCustomer = normalizedCustomer[1:]
+		}
+		if strings.HasPrefix(normalizedFrom, "0") {
+			normalizedFrom = normalizedFrom[1:]
+		}
+		
+		if normalizedCustomer == normalizedFrom {
+			return nil, fmt.Errorf("CRITICAL: Customer number (%s) matches Exophone (%s) - this will cause self-call", customerNumber, fromNumber)
 		}
 
-		// CRITICAL: Validate that target number is not same as From/CallerID
-		if targetNumber != "" && fromNumber != "" {
-			// Normalize for comparison
-			targetNorm := strings.ReplaceAll(targetNumber, " ", "")
-			targetNorm = strings.ReplaceAll(targetNorm, "-", "")
-			targetNorm = strings.ReplaceAll(targetNorm, "+", "")
-			fromNorm := strings.ReplaceAll(fromNumber, " ", "")
-			fromNorm = strings.ReplaceAll(fromNorm, "-", "")
-			fromNorm = strings.ReplaceAll(fromNorm, "+", "")
-			
-			// Remove country code prefix for comparison
-			if strings.HasPrefix(targetNorm, "91") && len(targetNorm) == 12 {
-				targetNorm = targetNorm[2:]
+		// Set parameters using HCall pattern
+		if voicebotUrl != "" {
+			// Use Url parameter (HCall pattern - more reliable)
+			data.Set("From", customerNumber)      // Customer number to call (HCall pattern)
+			data.Set("CallerId", fromNumber)      // Exophone (what shows on caller ID)
+			data.Set("Url", voicebotUrl)          // Voicebot applet URL (HCall pattern)
+			if req.CustomField != "" {
+				data.Set("CustomField", req.CustomField)
 			}
-			if strings.HasPrefix(fromNorm, "91") && len(fromNorm) == 12 {
-				fromNorm = fromNorm[2:]
-			}
-			// Remove leading 0 for comparison
-			if strings.HasPrefix(targetNorm, "0") {
-				targetNorm = targetNorm[1:]
-			}
-			if strings.HasPrefix(fromNorm, "0") {
-				fromNorm = fromNorm[1:]
-			}
-			
-			if targetNorm == fromNorm {
-				fmt.Printf("[ERROR] CRITICAL: Target number matches From number! This will cause self-call!\n")
-				fmt.Printf("[ERROR] From=%s, To=%s (normalized: %s == %s)\n", fromNumber, targetNumber, fromNorm, targetNorm)
-			}
+		} else {
+			// Fallback: Use AppletID (current pattern)
+			data.Set("From", fromNumber)       // Virtual Exophone (makes the call)
+			data.Set("To", customerNumber)     // Target number (customer we're calling)
+			data.Set("CallerId", req.CallerID) // Virtual Exophone (caller ID)
+			data.Set("CallType", req.CallType)
 		}
 
-		// CRITICAL: Log warning about Applet limitation
-		fmt.Printf("[INFO] Exotel ConnectCall Request:\n")
-		fmt.Printf("  - From: %s\n", fromNumber)
-		fmt.Printf("  - To: %s\n", targetNumber)
-		fmt.Printf("  - CallerId: %s\n", req.CallerID)
-		fmt.Printf("  - AppletID: %s\n", req.AppletID)
-		fmt.Printf("[WARNING] Using AppletID=%s - Ensure Applet URL in Dashboard is:\n", req.AppletID)
-		fmt.Printf("[WARNING] https://zoro-yvye.onrender.com/voicebot/init?target_number={{To}}\n")
-		fmt.Printf("[WARNING] Otherwise Exotel may create self-calls (From=To=VirtualNumber)\n")
+		// Log the actual parameters being sent (HCall pattern)
+		if voicebotUrl != "" {
+			fmt.Printf("[INFO] Exotel ConnectCall Request (HCall Pattern):\n")
+			fmt.Printf("  - From (Customer): %s\n", customerNumber)
+			fmt.Printf("  - CallerId (Exophone): %s\n", fromNumber)
+			fmt.Printf("  - Url (Voicebot): %s\n", voicebotUrl)
+			if req.CustomField != "" {
+				fmt.Printf("  - CustomField: %s\n", req.CustomField)
+			}
+			fmt.Printf("  - AppletID: %s\n", req.AppletID)
+			fmt.Printf("[INFO] Using HCall pattern - more reliable than AppletID parameter\n")
+		} else {
+			// Fallback logging for AppletID pattern
+			fmt.Printf("[INFO] Exotel ConnectCall Request (AppletID Pattern):\n")
+			fmt.Printf("  - From: %s\n", fromNumber)
+			fmt.Printf("  - To: %s\n", customerNumber)
+			fmt.Printf("  - CallerId: %s\n", req.CallerID)
+			fmt.Printf("  - AppletID: %s\n", req.AppletID)
+			fmt.Printf("[WARNING] Using AppletID parameter - less reliable than Url pattern\n")
+		}
 	} else {
 		// Regular call (non-Voicebot)
 		data.Set("From", req.From)
