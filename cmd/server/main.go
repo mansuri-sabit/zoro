@@ -510,19 +510,34 @@ func (s *UnifiedServer) InitiateCall(c *gin.Context) {
 		appletID = s.cfg.ExotelVoicebotAppletID
 	}
 
+	// CRITICAL FIX: Normalize phone number to Indian format (09324606985)
+	// Exotel might require this format instead of E.164 (+919324606985)
+	normalizedTo := req.To
+	// If number starts with +91, convert to 0 prefix format
+	if strings.HasPrefix(normalizedTo, "+91") && len(normalizedTo) == 13 {
+		normalizedTo = "0" + normalizedTo[3:] // +919324606985 -> 09324606985
+	} else if strings.HasPrefix(normalizedTo, "91") && len(normalizedTo) == 12 {
+		normalizedTo = "0" + normalizedTo[2:] // 919324606985 -> 09324606985
+	} else if len(normalizedTo) == 10 && !strings.HasPrefix(normalizedTo, "0") {
+		normalizedTo = "0" + normalizedTo // 9324606985 -> 09324606985
+	}
+
 	// CRITICAL FIX: Correct parameter mapping for outbound Voicebot calls
 	// For Exotel ConnectCall API with Voicebot Applets:
 	// - From = Virtual Exophone (the number that will make the call)
-	// - To = Target number (customer we're calling)
+	// - To = Target number (customer we're calling) - MUST be in correct format
 	// - CallerID = Virtual Exophone (what shows on caller ID)
 	callReq := exotel.ConnectCallRequest{
-		From:        req.CallerID, // Virtual Exophone (makes the call)
-		To:          req.To,       // Target number (customer we're calling)
-		CallerID:    req.CallerID, // Virtual Exophone (caller ID)
+		From:        req.CallerID,   // Virtual Exophone (makes the call)
+		To:          normalizedTo,   // Target number (customer we're calling) - normalized format
+		CallerID:    req.CallerID,   // Virtual Exophone (caller ID)
 		CallType:    "trans",
 		CallbackURL: "",
 		AppletID:    appletID,               // Use flow_id or configured Applet ID for voicebot
 		AccountSID:  s.cfg.ExotelAccountSID, // Required for building voicebot URL
+		// CRITICAL: Also pass in UserData and CustomField so Exotel Applet can access it
+		UserData:    fmt.Sprintf(`{"target_number":"%s","to_number":"%s","To":"%s"}`, normalizedTo, normalizedTo, normalizedTo),
+		CustomField: normalizedTo,
 	}
 
 	resp, err := s.exotelClient.ConnectCall(callReq)

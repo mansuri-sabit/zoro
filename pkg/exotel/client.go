@@ -103,13 +103,21 @@ func (c *Client) ConnectCall(req ConnectCallRequest) (*ConnectCallResponse, erro
 		// CRITICAL: For Voicebot Applets, also pass target number in UserData
 		// This ensures Exotel preserves it even if To parameter is ignored
 		// Some Applets can access UserData from their flow
-		if targetNumber != "" {
+		if req.UserData != "" {
+			// Use UserData from request if provided
+			data.Set("UserData", req.UserData)
+		} else if targetNumber != "" {
+			// Fallback: generate UserData with target number
 			data.Set("UserData", fmt.Sprintf(`{"target_number":"%s","to_number":"%s","To":"%s"}`, targetNumber, targetNumber, targetNumber))
 		}
 
 		// CRITICAL: Also try passing as CustomField if Exotel supports it
 		// Some Exotel configurations use CustomField for target numbers
-		if targetNumber != "" {
+		if req.CustomField != "" {
+			// Use CustomField from request if provided
+			data.Set("CustomField", req.CustomField)
+		} else if targetNumber != "" {
+			// Fallback: use target number as CustomField
 			data.Set("CustomField", targetNumber)
 		}
 
